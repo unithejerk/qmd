@@ -190,11 +190,13 @@ function resolveEndpoint(
 /**
  * Resolve a RemoteLLMConfig from environment variables and optional YAML models config.
  *
- * Priority: environment variables > YAML models config > defaults.
+ * Priority: environment variables > YAML models config > local-first defaults.
  *
  * This allows users to configure remote expand/generate/rerank endpoints
- * in their index.yml under the `models:` key, falling back to env vars
- * and then built-in defaults.
+ * in their index.yml under the `models:` key, falling back to env vars.
+ * Local-first defaults: embed defaults to localhost:11434 (vLLM/Ollama),
+ * while expand/generate/rerank default to empty (local LlamaCpp) unless
+ * explicitly configured via env vars or YAML.
  */
 export function remoteConfigFromEnv(models?: ModelsConfig): RemoteLLMConfig {
   // --- Embed ---
@@ -207,26 +209,26 @@ export function remoteConfigFromEnv(models?: ModelsConfig): RemoteLLMConfig {
   };
 
   // --- Expand ---
-  // Priority: QMD_EXPAND_* env vars > models.expand_api_* YAML > OpenRouter defaults
+  // Priority: QMD_EXPAND_* env vars > models.expand_api_* YAML > empty (local-first)
   const expand: EndpointConfig = {
-    baseUrl: (process.env.QMD_EXPAND_BASE_URL || models?.expand_api_url || OPENROUTER_DEFAULT_URL).replace(/\/+$/, ''),
-    model: process.env.QMD_EXPAND_MODEL || models?.expand_api_model || 'google/gemini-2.0-flash-lite-001',
+    baseUrl: (process.env.QMD_EXPAND_BASE_URL || models?.expand_api_url || '').replace(/\/+$/, ''),
+    model: process.env.QMD_EXPAND_MODEL || models?.expand_api_model || '',
     apiKey: (process.env.QMD_EXPAND_API_KEY || models?.expand_api_key || process.env.OPENAI_API_KEY || '').trim(),
   };
 
   // --- Rerank ---
-  // Priority: QMD_RERANK_* env vars > models.rerank_api_* YAML (not yet in ModelsConfig) > OpenRouter defaults
+  // Priority: QMD_RERANK_* env vars > models.rerank_api_* YAML > empty (local-first)
   const rerank: EndpointConfig = {
-    baseUrl: (process.env.QMD_RERANK_BASE_URL || OPENROUTER_DEFAULT_URL).replace(/\/+$/, ''),
-    model: process.env.QMD_RERANK_MODEL || 'cohere/rerank-v3.5',
-    apiKey: (process.env.QMD_RERANK_API_KEY || process.env.OPENAI_API_KEY || '').trim(),
+    baseUrl: (process.env.QMD_RERANK_BASE_URL || models?.rerank_api_url || '').replace(/\/+$/, ''),
+    model: process.env.QMD_RERANK_MODEL || models?.rerank_api_model || '',
+    apiKey: (process.env.QMD_RERANK_API_KEY || models?.rerank_api_key || process.env.OPENAI_API_KEY || '').trim(),
   };
 
   // --- Generate ---
-  // Priority: QMD_GENERATE_* env vars > models.generate_api_* YAML > OpenRouter defaults
+  // Priority: QMD_GENERATE_* env vars > models.generate_api_* YAML > empty (local-first)
   const generate: EndpointConfig = {
-    baseUrl: (process.env.QMD_GENERATE_BASE_URL || models?.generate_api_url || OPENROUTER_DEFAULT_URL).replace(/\/+$/, ''),
-    model: process.env.QMD_GENERATE_MODEL || models?.generate_api_model || 'google/gemini-2.0-flash-lite-001',
+    baseUrl: (process.env.QMD_GENERATE_BASE_URL || models?.generate_api_url || '').replace(/\/+$/, ''),
+    model: process.env.QMD_GENERATE_MODEL || models?.generate_api_model || '',
     apiKey: (process.env.QMD_GENERATE_API_KEY || models?.generate_api_key || process.env.OPENAI_API_KEY || '').trim(),
   };
 
