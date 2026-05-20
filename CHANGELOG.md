@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Changes
+
+- Config: add YAML config fields `expand_api_url`, `expand_api_model`, `expand_api_key`, `generate_api_url`, `generate_api_model`, `generate_api_key` to `models:` section in `index.yml`. These allow remote expand/generate endpoints to be configured via YAML instead of only environment variables. Env vars (`QMD_EXPAND_*`, `QMD_GENERATE_*`) still take precedence over YAML values.
+- CLI: `RemoteLLM` now reads YAML config for expand and generate endpoints via `remoteConfigFromEnv()`, enabling `qmd` to use remote expand/generate without setting environment variables.
+- API: `isRemoteConfigured()` now accepts an optional `ModelsConfig` parameter and considers `expand_api_url` and `generate_api_url` fields when detecting remote LLM mode.
+
 ## [2.5.3] - 2026-05-28
 
 ### Features
@@ -84,7 +90,6 @@
 ### Fixes
 
 - Launcher: Rewrite `bin/qmd` as a Node-based shebang polyglot to fix global npm installation execution failures on Windows (#668 / #452), while supporting seamless fallback to Bun in Node-less environments.
-
 
 ## [2.5.1] - 2026-05-20
 
