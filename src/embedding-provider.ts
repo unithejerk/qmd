@@ -12,6 +12,9 @@
  * Phase 5: Per-endpoint config + real expand/rerank/generate via OpenRouter.
  */
 
+import * as http from 'http';
+import * as https from 'https';
+import { URL } from 'url';
 import type {
   LLM,
   EmbeddingResult,
@@ -59,13 +62,107 @@ export type RemoteLLMConfig = {
 const OPENROUTER_DEFAULT_URL = 'https://openrouter.ai/api/v1';
 
 /**
- * Workaround for Node.js undici ByteString bug with Unicode chars > 255.
- * Returns a Buffer so undici doesn't try to re-encode the string through its
- * broken ByteString path.
+ * Low-level HTTP/HTTPS POST using Node's built-in http/https modules.
+ *
+ * Bypasses the global fetch() / undici entirely, which avoids the Node v24
+ * undici ByteString bug (https://github.com/nodejs/node/issues/xxxx) that
+ * crashes when response bodies contain Unicode code points > U+00FF (e.g.
+ * U+2026 HORIZONTAL ELLIPSIS returned by OpenRouter).
+ *
+ * Returns the parsed JSON response body, or throws on non-2xx status.
  */
-function jsonBody(obj: unknown): Buffer {
-  return Buffer.from(JSON.stringify(obj), 'utf-8');
+async function nodePost(urlStr: string, headers: Record<string, string>, body: unknown, timeoutMs = 30000): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(urlStr);
+    const bodyBuf = Buffer.from(JSON.stringify(body), 'utf-8');
+    const requestHeaders: Record<string, string> = {
+      ...headers,
+      'Content-Type': 'application/json',
+      'Content-Length': String(bodyBuf.length),
+    };
+
+    const transport = url.protocol === 'https:' ? https : http;
+    const req = transport.request(
+      {
+        hostname: url.hostname,
+        port: url.port || (url.protocol === 'https:' ? 443 : 80),
+        path: url.pathname + url.search,
+        method: 'POST',
+        headers: requestHeaders,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+        res.on('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf-8');
+          const status = res.statusCode ?? 0;
+          if (status < 200 || status >= 300) {
+            reject(new Error(`HTTP ${status}: ${raw.slice(0, 200)}`));
+            return;
+          }
+          try {
+            resolve(JSON.parse(raw));
+          } catch (e) {
+            reject(new Error(`JSON parse failed: ${(e as Error).message} — body: ${raw.slice(0, 200)}`));
+          }
+        });
+        res.on('error', reject);
+      },
+    );
+
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`Request timed out after ${timeoutMs}ms`));
+    });
+    req.write(bodyBuf);
+    req.end();
+  });
 }
+
+/**
+ * Low-level HTTP/HTTPS GET using Node's built-in http/https modules.
+ * Used for /models endpoint health checks.
+ */
+async function nodeGet(urlStr: string, headers: Record<string, string>, timeoutMs = 5000): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(urlStr);
+    const transport = url.protocol === 'https:' ? https : http;
+    const req = transport.request(
+      {
+        hostname: url.hostname,
+        port: url.port || (url.protocol === 'https:' ? 443 : 80),
+        path: url.pathname + url.search,
+        method: 'GET',
+        headers,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+        res.on('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf-8');
+          const status = res.statusCode ?? 0;
+          if (status < 200 || status >= 300) {
+            reject(new Error(`HTTP ${status}: ${raw.slice(0, 200)}`));
+            return;
+          }
+          try {
+            resolve(JSON.parse(raw));
+          } catch (e) {
+            reject(new Error(`JSON parse failed: ${(e as Error).message}`));
+          }
+        });
+        res.on('error', reject);
+      },
+    );
+
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`Request timed out after ${timeoutMs}ms`));
+    });
+    req.end();
+  });
+}
+
 
 /**
  * Resolve an EndpointConfig from env vars with fallback chain.
@@ -79,7 +176,7 @@ function resolveEndpoint(
   const baseUrl =
     (process.env[`QMD_${envSuffix}_BASE_URL`] || urlDefault).replace(/\/+$/, '');
   const model = process.env[`QMD_${envSuffix}_MODEL`] || modelDefault;
-  const apiKey = process.env[`QMD_${envSuffix}_API_KEY`] || process.env.OPENAI_API_KEY;
+  const apiKey = (process.env[`QMD_${envSuffix}_API_KEY`] || process.env.OPENAI_API_KEY || '').trim();
   return { baseUrl, model, apiKey };
 }
 
@@ -111,13 +208,13 @@ export class RemoteLLM implements LLM {
       this.embedCfg = {
         baseUrl: config.embed.baseUrl.replace(/\/+$/, ''),
         model: config.embed.model,
-        apiKey: config.embed.apiKey || process.env.OPENAI_API_KEY,
+        apiKey: (config.embed.apiKey || process.env.OPENAI_API_KEY || "").trim(),
       };
     } else if (oldBaseUrl) {
       this.embedCfg = {
         baseUrl: oldBaseUrl.replace(/\/+$/, ''),
         model: oldModel || process.env.QMD_EMBED_MODEL || 'Qwen/Qwen3-Embedding-0.6B',
-        apiKey: oldKey || process.env.OPENAI_API_KEY,
+        apiKey: (oldKey || process.env.OPENAI_API_KEY || '').trim(),
       };
     } else {
       this.embedCfg = resolveEndpoint('embed', 'EMBED', 'Qwen/Qwen3-Embedding-0.6B', 'http://localhost:11434/v1');
@@ -128,7 +225,7 @@ export class RemoteLLM implements LLM {
       this.expandCfg = {
         baseUrl: config.expand.baseUrl.replace(/\/+$/, ''),
         model: config.expand.model,
-        apiKey: config.expand.apiKey || process.env.OPENAI_API_KEY,
+        apiKey: (config.expand.apiKey || process.env.OPENAI_API_KEY || "").trim(),
       };
     } else {
       this.expandCfg = resolveEndpoint('expand', 'EXPAND', 'google/gemini-2.0-flash-lite-001', OPENROUTER_DEFAULT_URL);
@@ -139,7 +236,7 @@ export class RemoteLLM implements LLM {
       this.rerankCfg = {
         baseUrl: config.rerank.baseUrl.replace(/\/+$/, ''),
         model: config.rerank.model,
-        apiKey: config.rerank.apiKey || process.env.OPENAI_API_KEY,
+        apiKey: (config.rerank.apiKey || process.env.OPENAI_API_KEY || "").trim(),
       };
     } else {
       this.rerankCfg = resolveEndpoint('rerank', 'RERANK', 'cohere/rerank-v3.5', OPENROUTER_DEFAULT_URL);
@@ -150,7 +247,7 @@ export class RemoteLLM implements LLM {
       this.generateCfg = {
         baseUrl: config.generate.baseUrl.replace(/\/+$/, ''),
         model: config.generate.model,
-        apiKey: config.generate.apiKey || process.env.OPENAI_API_KEY,
+        apiKey: (config.generate.apiKey || process.env.OPENAI_API_KEY || "").trim(),
       };
     } else {
       this.generateCfg = resolveEndpoint('generate', 'GENERATE', 'google/gemini-2.0-flash-lite-001', OPENROUTER_DEFAULT_URL);
@@ -202,36 +299,17 @@ export class RemoteLLM implements LLM {
 
     for (let attempt = 0; attempt < retries; attempt++) {
       try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
-
-        const headers: Record<string, string> = {
-          'Content-Type': 'application/json',
-        };
+        const headers: Record<string, string> = {};
         if (this.embedCfg.apiKey) {
-          headers['Authorization'] = `Bearer ${this.embedCfg.apiKey}`;
+          headers['Authorization'] = `Bearer ${this.embedCfg.apiKey.trim()}`;
         }
 
-        const resp = await fetch(`${this.embedCfg.baseUrl}/embeddings`, {
-          method: 'POST',
+        const data = await nodePost(
+          `${this.embedCfg.baseUrl}/embeddings`,
           headers,
-          body: jsonBody({
-            model: this.embedCfg.model,
-            input: texts,
-          }),
-          signal: controller.signal,
-        });
-
-        clearTimeout(timeout);
-
-        if (!resp.ok) {
-          const errBody = await resp.text().catch(() => '');
-          throw new Error(`Embedding API error ${resp.status}: ${errBody.slice(0, 200)}`);
-        }
-
-        const data = await resp.json() as {
-          data: Array<{ embedding: number[]; index?: number }>;
-        };
+          { model: this.embedCfg.model, input: texts },
+          this.timeoutMs,
+        ) as { data: Array<{ embedding: number[]; index?: number }> };
 
         return data.data.map((item) => ({
           embedding: item.embedding,
@@ -258,41 +336,22 @@ export class RemoteLLM implements LLM {
   async generate(prompt: string, _options?: GenerateOptions): Promise<GenerateResult | null> {
     try {
       const ep = this.generateCfg;
-      const baseUrl = ep.baseUrl;
-
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
-
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-      };
+      const headers: Record<string, string> = {};
       if (ep.apiKey) {
-        headers['Authorization'] = `Bearer ${ep.apiKey}`;
+        headers['Authorization'] = `Bearer ${ep.apiKey.trim()}`;
       }
 
-      const resp = await fetch(`${baseUrl}/chat/completions`, {
-        method: 'POST',
+      const data = await nodePost(
+        `${ep.baseUrl}/chat/completions`,
         headers,
-        body: jsonBody({
+        {
           model: ep.model,
           messages: [{ role: 'user', content: prompt }],
           max_tokens: _options?.maxTokens ?? 1024,
           temperature: _options?.temperature ?? 0.7,
-        }),
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeout);
-
-      if (!resp.ok) {
-        const errBody = await resp.text().catch(() => '');
-        throw new Error(`Generate API error ${resp.status}: ${errBody.slice(0, 200)}`);
-      }
-
-      const data = await resp.json() as {
-        choices: Array<{ message: { content: string } }>;
-        model: string;
-      };
+        },
+        this.timeoutMs,
+      ) as { choices: Array<{ message: { content: string } }>; model: string };
 
       return {
         text: data.choices[0]?.message?.content ?? '',
@@ -311,9 +370,6 @@ export class RemoteLLM implements LLM {
 
   async modelExists(model: string): Promise<ModelInfo> {
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 5000);
-
       const headers: Record<string, string> = {};
       if (this.embedCfg.apiKey) {
         headers['Authorization'] = `Bearer ${this.embedCfg.apiKey}`;
@@ -321,19 +377,10 @@ export class RemoteLLM implements LLM {
 
       // Try the embed base URL's models endpoint (works for vLLM, OpenAI, etc.)
       const baseForModels = this.embedCfg.baseUrl.replace(/\/v1$/, '');
-      const resp = await fetch(`${baseForModels}/models`, {
-        headers,
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeout);
-
-      if (resp.ok) {
-        const data = await resp.json() as { data?: Array<{ id: string }> };
-        if (data.data) {
-          const exists = data.data.some((m: { id: string }) => m.id === model);
-          return { name: model, exists };
-        }
+      const data = await nodeGet(`${baseForModels}/models`, headers, 5000) as { data?: Array<{ id: string }> };
+      if (data.data) {
+        const exists = data.data.some((m: { id: string }) => m.id === model);
+        return { name: model, exists };
       }
     } catch {
       // Fall through — return exists: true as before
@@ -364,34 +411,17 @@ hyde: <short hypothetical document passage>
 Original query: "${query}"`;
 
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
-
-      const resp = await fetch(`${ep.baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${ep.apiKey}`,
-        },
-        body: jsonBody({
+      const data = await nodePost(
+        `${ep.baseUrl}/chat/completions`,
+        { 'Authorization': `Bearer ${ep.apiKey}` },
+        {
           model: ep.model,
           messages: [{ role: 'user', content: prompt }],
           max_tokens: 600,
           temperature: 0.7,
-        }),
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeout);
-
-      if (!resp.ok) {
-        const errBody = await resp.text().catch(() => '');
-        throw new Error(`Expand API error ${resp.status}: ${errBody.slice(0, 200)}`);
-      }
-
-      const data = await resp.json() as {
-        choices: Array<{ message: { content: string } }>;
-      };
+        },
+        this.timeoutMs,
+      ) as { choices: Array<{ message: { content: string } }> };
 
       const content = data.choices[0]?.message?.content ?? '';
 
@@ -438,35 +468,17 @@ Original query: "${query}"`;
     }
 
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
-
-      const resp = await fetch(`${ep.baseUrl}/rerank`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${ep.apiKey}`,
-        },
-        body: jsonBody({
+      const data = await nodePost(
+        `${ep.baseUrl}/rerank`,
+        { 'Authorization': `Bearer ${ep.apiKey}` },
+        {
           model: ep.model,
           query,
           documents: documents.map(d => d.text),
           top_n: documents.length,
-        }),
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeout);
-
-      if (!resp.ok) {
-        const errBody = await resp.text().catch(() => '');
-        throw new Error(`Rerank API error ${resp.status}: ${errBody.slice(0, 200)}`);
-      }
-
-      const data = await resp.json() as {
-        results: Array<{ index: number; relevance_score: number }>;
-        model?: string;
-      };
+        },
+        this.timeoutMs,
+      ) as { results: Array<{ index: number; relevance_score: number }>; model?: string };
 
       return {
         results: data.results.map(r => ({
