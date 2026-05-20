@@ -42,6 +42,9 @@ export interface ModelsConfig {
   generate?: string;
 
   // Remote API endpoint configuration (env vars take precedence)
+  embed_api_url?: string;    // Remote embed API base URL
+  embed_api_model?: string;  // Remote embed model name
+  embed_api_key?: string;    // Bearer token for remote embed API
   expand_api_url?: string;    // Remote query expansion API base URL
   expand_api_model?: string;  // Remote query expansion model name
   expand_api_key?: string;    // Bearer token for remote expand API

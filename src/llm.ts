@@ -2106,7 +2106,9 @@ export function isRemoteConfigured(models?: ModelsConfig): boolean {
     process.env.QMD_EXPAND_BASE_URL ||
     process.env.QMD_RERANK_BASE_URL ||
     process.env.QMD_GENERATE_BASE_URL ||
+    models?.embed_api_url ||
     models?.expand_api_url ||
+    models?.rerank_api_url ||
     models?.generate_api_url
   );
 }
