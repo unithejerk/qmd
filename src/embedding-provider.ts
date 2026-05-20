@@ -194,17 +194,18 @@ function resolveEndpoint(
  *
  * This allows users to configure remote expand/generate/rerank endpoints
  * in their index.yml under the `models:` key, falling back to env vars.
- * Local-first defaults: embed defaults to localhost:11434 (vLLM/Ollama),
- * while expand/generate/rerank default to empty (local LlamaCpp) unless
- * explicitly configured via env vars or YAML.
+ * Local-first defaults: all endpoints default to empty (local LlamaCpp)
+ * unless explicitly configured via env vars or YAML.
+ * 
+ * 
  */
 export function remoteConfigFromEnv(models?: ModelsConfig): RemoteLLMConfig {
   // --- Embed ---
-  // Embed endpoint has always supported env vars; YAML config adds no new
-  // embed_api_* fields in this phase, but the existing flat env vars apply.
+  // Priority: QMD_EMBED_* env vars > OPENAI_* fallback > empty (local-first)
+  // Empty baseUrl means: fall back to local LlamaCpp embeddings.
   const embed: EndpointConfig = {
-    baseUrl: (process.env.QMD_EMBED_BASE_URL || process.env.OPENAI_BASE_URL || 'http://localhost:11434/v1').replace(/\/+$/, ''),
-    model: process.env.QMD_EMBED_MODEL || 'Qwen/Qwen3-Embedding-0.6B',
+    baseUrl: (process.env.QMD_EMBED_BASE_URL || process.env.OPENAI_BASE_URL || '').replace(/\/+$/, ''),
+    model: process.env.QMD_EMBED_MODEL || '',
     apiKey: (process.env.QMD_EMBED_API_KEY || process.env.OPENAI_API_KEY || '').trim(),
   };
 

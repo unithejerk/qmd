@@ -803,14 +803,14 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 
 ### Remote LLM Endpoints
 
-When `QMD_EMBED_PROVIDER=remote` or any `QMD_*_BASE_URL` environment variable is set, QMD uses a remote LLM provider (vLLM, Ollama, OpenRouter, etc.) instead of local GGUF models. Configure each endpoint via environment variables **or** YAML config — env vars take precedence. Defaults are local-first: only embed defaults to a remote URL (localhost:11434); expand, rerank, and generate default to local LlamaCpp unless explicitly configured. Defaults are local-first: only embed defaults to a remote URL (localhost:11434); expand, rerank, and generate default to local LlamaCpp unless explicitly configured.
+When `QMD_EMBED_PROVIDER=remote` or any `QMD_*_BASE_URL` environment variable is set, QMD uses a remote LLM provider (vLLM, Ollama, OpenRouter, etc.) instead of local GGUF models. Configure each endpoint via environment variables **or** YAML config — env vars take precedence. All endpoints default to local LlamaCpp unless explicitly configured via env vars or YAML. Set `QMD_EMBED_BASE_URL` (or `embed_api_url` in YAML) to use a remote embedding server like vLLM or Ollama.
 
 **Environment variables:**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `QMD_EMBED_BASE_URL` | — | Embed API base URL (e.g. `http://localhost:11434/v1`)
-| `QMD_EMBED_MODEL` | `Qwen/Qwen3-Embedding-0.6B` | Embed model name |
+| `QMD_EMBED_MODEL` | *(empty, local)* | Embed model name |
 | `QMD_EMBED_API_KEY` | — | Bearer token for embed API |
 | `QMD_EXPAND_BASE_URL` | *(empty, local)* | Expand API base URL |
 | `QMD_EXPAND_MODEL` | *(empty, local)* | Expand model name |
