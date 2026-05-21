@@ -2035,22 +2035,10 @@ function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
 }
 
 function ensureModelsConfiguredForCli(): { embed: string; generate: string; rerank: string } {
+  // Read-only resolution: config + env + defaults, no auto-save
   try {
     const config = loadConfig();
-    const models = resolveModels(config.models);
-    const current = config.models ?? {};
-    if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
-      saveConfig({
-        ...config,
-        models: {
-          ...current,
-          embed: models.embed,
-          generate: models.generate,
-          rerank: models.rerank,
-        },
-      });
-    }
-    return models;
+    return resolveModels(config.models);
   } catch {
     return resolveModels();
   }
