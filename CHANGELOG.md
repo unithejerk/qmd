@@ -4,9 +4,11 @@
 
 ### Changes
 
-- Config: add YAML config fields `expand_api_url`, `expand_api_model`, `expand_api_key`, `generate_api_url`, `generate_api_model`, `generate_api_key` to `models:` section in `index.yml`. These allow remote expand/generate endpoints to be configured via YAML instead of only environment variables. Env vars (`QMD_EXPAND_*`, `QMD_GENERATE_*`) still take precedence over YAML values.
-- CLI: `RemoteLLM` now reads YAML config for expand and generate endpoints via `remoteConfigFromEnv()`, enabling `qmd` to use remote expand/generate without setting environment variables.
-- API: `isRemoteConfigured()` now accepts an optional `ModelsConfig` parameter and considers `expand_api_url` and `generate_api_url` fields when detecting remote LLM mode.
+- Config: add YAML config fields for remote API endpoints to `models:` section in `index.yml`: `expand_api_url/model/key`, `rerank_api_url/model/key`, `generate_api_url/model/key`. These allow remote expand/rerank/generate endpoints to be configured via YAML instead of only environment variables. Env vars still take precedence over YAML values.
+- Config: local-first defaults — ALL endpoints (embed, expand, rerank, generate) default to empty (local LlamaCpp). No remote URLs are assumed. Users must explicitly configure any remote endpoints via env vars or YAML. The previous default of `http://localhost:11434/v1` for embed has been removed.
+- CLI: `RemoteLLM` now reads YAML config for expand, rerank, and generate endpoints via `remoteConfigFromEnv()`, enabling `qmd` to use remote endpoints without setting environment variables.
+- API: `isRemoteConfigured()` now accepts an optional `ModelsConfig` parameter and considers `expand_api_url`, `generate_api_url`, and `rerank_api_url` fields when detecting remote LLM mode.
+- API: `ModelsConfig` now includes `rerank_api_url`, `rerank_api_model`, `rerank_api_key` fields alongside the existing expand/generate fields.
 
 ## [2.5.3] - 2026-05-28
 

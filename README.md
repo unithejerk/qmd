@@ -803,23 +803,23 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 
 ### Remote LLM Endpoints
 
-When `QMD_EMBED_PROVIDER=remote` or any `QMD_*_BASE_URL` environment variable is set, QMD uses a remote LLM provider (vLLM, Ollama, OpenRouter, etc.) instead of local GGUF models. Configure each endpoint via environment variables **or** YAML config — env vars take precedence.
+When `QMD_EMBED_PROVIDER=remote` or any `QMD_*_BASE_URL` environment variable is set, QMD uses a remote LLM provider (vLLM, Ollama, OpenRouter, etc.) instead of local GGUF models. Configure each endpoint via environment variables **or** YAML config — env vars take precedence. All endpoints default to local LlamaCpp unless explicitly configured via env vars or YAML. Set `QMD_EMBED_BASE_URL` (or `embed_api_url` in YAML) to use a remote embedding server like vLLM or Ollama.
 
 **Environment variables:**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `QMD_EMBED_BASE_URL` | — | Embed API base URL (e.g. `http://localhost:11434/v1`)
-| `QMD_EMBED_MODEL` | `Qwen/Qwen3-Embedding-0.6B` | Embed model name |
+| `QMD_EMBED_MODEL` | *(empty, local)* | Embed model name |
 | `QMD_EMBED_API_KEY` | — | Bearer token for embed API |
-| `QMD_EXPAND_BASE_URL` | OpenRouter | Expand API base URL |
-| `QMD_EXPAND_MODEL` | `google/gemini-2.0-flash-lite-001` | Expand model name |
+| `QMD_EXPAND_BASE_URL` | *(empty, local)* | Expand API base URL |
+| `QMD_EXPAND_MODEL` | *(empty, local)* | Expand model name |
 | `QMD_EXPAND_API_KEY` | — | Bearer token for expand API |
-| `QMD_RERANK_BASE_URL` | OpenRouter | Rerank API base URL |
-| `QMD_RERANK_MODEL` | `cohere/rerank-v3.5` | Rerank model name |
+| `QMD_RERANK_BASE_URL` | *(empty, local)* | Rerank API base URL |
+| `QMD_RERANK_MODEL` | *(empty, local)* | Rerank model name |
 | `QMD_RERANK_API_KEY` | — | Bearer token for rerank API |
-| `QMD_GENERATE_BASE_URL` | OpenRouter | Generate API base URL |
-| `QMD_GENERATE_MODEL` | `google/gemini-2.0-flash-lite-001` | Generate model name |
+| `QMD_GENERATE_BASE_URL` | *(empty, local)* | Generate API base URL |
+| `QMD_GENERATE_MODEL` | *(empty, local)* | Generate model name |
 | `QMD_GENERATE_API_KEY` | — | Bearer token for generate API |
 | `OPENAI_BASE_URL` | — | Fallback base URL for embed endpoint (backward compat)
 | `OPENAI_API_KEY` | — | Fallback API key for all endpoints
@@ -831,10 +831,13 @@ models:
   embed: hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf
   rerank: hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf
   generate: hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf
-  expand_api_url: https://openrouter.ai/api/v1
+  expand_api_url: https://openrouter.ai/api/v1  # or leave empty for local LlamaCpp
   expand_api_model: google/gemini-2.0-flash-lite-001
   expand_api_key: sk-or-...
-  generate_api_url: https://openrouter.ai/api/v1
+  rerank_api_url: https://openrouter.ai/api/v1  # or leave empty for local LlamaCpp
+  rerank_api_model: cohere/rerank-v3.5
+  rerank_api_key: sk-or-...
+  generate_api_url: https://openrouter.ai/api/v1  # or leave empty for local LlamaCpp
   generate_api_model: google/gemini-2.0-flash-lite-001
   generate_api_key: sk-or-...
 ```
@@ -844,11 +847,14 @@ models:
 | `embed` | `QMD_EMBED_MODEL` | embeddinggemma | Local GGUF model URI for embeddings |
 | `rerank` | `QMD_RERANK_MODEL` | qwen3-reranker | Local GGUF model URI for reranking |
 | `generate` | `QMD_GENERATE_MODEL` | qmd-query-expansion | Local GGUF model URI for generation |
-| `expand_api_url` | `QMD_EXPAND_BASE_URL` | OpenRouter | Remote expand API base URL |
-| `expand_api_model` | `QMD_EXPAND_MODEL` | gemini-2.0-flash-lite | Remote expand model name |
+| `expand_api_url` | `QMD_EXPAND_BASE_URL` | *(empty, local)* | Remote expand API base URL |
+| `expand_api_model` | `QMD_EXPAND_MODEL` | *(empty, local)* | Remote expand model name |
 | `expand_api_key` | `QMD_EXPAND_API_KEY` | — | Bearer token for remote expand API |
-| `generate_api_url` | `QMD_GENERATE_BASE_URL` | OpenRouter | Remote generate API base URL |
-| `generate_api_model` | `QMD_GENERATE_MODEL` | gemini-2.0-flash-lite | Remote generate model name |
+| `rerank_api_url` | `QMD_RERANK_BASE_URL` | *(empty, local)* | Remote rerank API base URL |
+| `rerank_api_model` | `QMD_RERANK_MODEL` | *(empty, local)* | Remote rerank model name |
+| `rerank_api_key` | `QMD_RERANK_API_KEY` | — | Bearer token for remote rerank API |
+| `generate_api_url` | `QMD_GENERATE_BASE_URL` | *(empty, local)* | Remote generate API base URL |
+| `generate_api_model` | `QMD_GENERATE_MODEL` | *(empty, local)* | Remote generate model name |
 | `generate_api_key` | `QMD_GENERATE_API_KEY` | — | Bearer token for remote generate API |
 
 Env vars always take precedence over YAML config values.
