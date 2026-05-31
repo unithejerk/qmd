@@ -7,6 +7,10 @@
  *
  * @module remote/types
  */
+import type { RemoteApiFormat } from '../collections.js';
+
+/** Logical endpoint roles used by RemoteLLM. */
+export type EndpointRole = 'embed' | 'expand' | 'rerank' | 'generate';
 
 /**
  * Configuration for a single remote API endpoint.
@@ -18,6 +22,8 @@
 export type EndpointConfig = {
   /** Base URL for the API (e.g. https://openrouter.ai/api/v1). Trailing slash trimmed. */
   baseUrl: string;
+  /** Protocol contract for this endpoint (used by adapter selection). */
+  format?: RemoteApiFormat;
   /** Model identifier string (e.g. google/gemini-2.0-flash-lite-001) */
   model: string;
   /** Optional Bearer token for authenticated endpoints */

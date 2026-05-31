@@ -16,7 +16,12 @@ import type { AddressInfo } from 'net';
 import { nodePost, nodeGet, MAX_RESPONSE_BODY_BYTES } from '../src/remote/transport.js';
 import { CircuitBreaker } from '../src/remote/circuit-breaker.js';
 import { consoleLogger, silentLogger, type Logger } from '../src/remote/log.js';
-import { resolveEndpoint, remoteConfigFromEnv, OPENROUTER_DEFAULT_URL } from '../src/remote/config.js';
+import {
+  resolveEndpoint,
+  remoteConfigFromEnv,
+  OPENROUTER_DEFAULT_URL,
+  resolveEndpointFormat,
+} from '../src/remote/config.js';
 import {
   embedBatch,
 } from '../src/remote/embed.js';
@@ -313,19 +318,27 @@ describe('remoteConfigFromEnv', () => {
 
     const config = remoteConfigFromEnv({
       embed_api_url: 'http://embed:8000/v1',
+      embed_api_format: 'cohere_v2_embed',
       embed_api_model: 'embed-model',
       expand_api_url: 'http://expand:8000/v1',
+      expand_api_format: 'openai_chat_completions',
       expand_api_model: 'expand-model',
       rerank_api_url: 'http://rerank:8000/v1',
+      rerank_api_format: 'cohere_v1_rerank',
       rerank_api_model: 'rerank-model',
       generate_api_url: 'http://generate:8000/v1',
+      generate_api_format: 'anthropic_messages',
       generate_api_model: 'gen-model',
     });
     expect(config.embed!.baseUrl).toBe('http://embed:8000/v1');
     expect(config.embed!.model).toBe('embed-model');
+    expect(config.embed!.format).toBe('cohere_v2_embed');
     expect(config.expand!.baseUrl).toBe('http://expand:8000/v1');
+    expect(config.expand!.format).toBe('openai_chat_completions');
     expect(config.rerank!.baseUrl).toBe('http://rerank:8000/v1');
+    expect(config.rerank!.format).toBe('cohere_v1_rerank');
     expect(config.generate!.baseUrl).toBe('http://generate:8000/v1');
+    expect(config.generate!.format).toBe('anthropic_messages');
 
     restoreEnv(...saved);
   });
@@ -338,6 +351,60 @@ describe('remoteConfigFromEnv', () => {
     expect(config.embed!.baseUrl).toBe('http://openai:8000/v1');
     delete process.env.OPENAI_BASE_URL;
     restoreEnv(...saved);
+  });
+
+  test('defaults endpoint formats to auto', () => {
+    const saved = [
+      saveEnv('QMD_EMBED_API_FORMAT'),
+      saveEnv('QMD_EXPAND_API_FORMAT'),
+      saveEnv('QMD_RERANK_API_FORMAT'),
+      saveEnv('QMD_GENERATE_API_FORMAT'),
+    ];
+    for (const { key } of saved) delete process.env[key];
+
+    const config = remoteConfigFromEnv();
+    expect(config.embed!.format).toBe('auto');
+    expect(config.expand!.format).toBe('auto');
+    expect(config.rerank!.format).toBe('auto');
+    expect(config.generate!.format).toBe('auto');
+
+    restoreEnv(...saved);
+  });
+
+  test('supports short format aliases from env', () => {
+    const saved = [saveEnv('QMD_EMBED_API_FORMAT'), saveEnv('QMD_RERANK_API_FORMAT')];
+    process.env.QMD_EMBED_API_FORMAT = 'openai_v1';
+    process.env.QMD_RERANK_API_FORMAT = 'cohere_rerank';
+
+    const config = remoteConfigFromEnv();
+    expect(config.embed!.format).toBe('openai_v1_embeddings');
+    expect(config.rerank!.format).toBe('cohere_v2_rerank');
+
+    restoreEnv(...saved);
+  });
+
+  test('throws on invalid endpoint format', () => {
+    const saved = [saveEnv('QMD_EMBED_API_FORMAT')];
+    process.env.QMD_EMBED_API_FORMAT = 'totally_invalid_format';
+    expect(() => remoteConfigFromEnv()).toThrow(/Invalid embed API format/);
+    restoreEnv(...saved);
+  });
+
+  test('throws when format is unsupported for endpoint role', () => {
+    const saved = [saveEnv('QMD_EMBED_API_FORMAT')];
+    process.env.QMD_EMBED_API_FORMAT = 'anthropic_messages';
+    expect(() => remoteConfigFromEnv()).toThrow(/Allowed formats for embed/);
+    restoreEnv(...saved);
+  });
+});
+
+describe('resolveEndpointFormat', () => {
+  test('returns auto when no env/yaml format is set', () => {
+    expect(resolveEndpointFormat('embed', 'EMBED')).toBe('auto');
+  });
+
+  test('normalizes dash/space variants', () => {
+    expect(resolveEndpointFormat('expand', 'EXPAND', 'openai-chat')).toBe('openai_chat_completions');
   });
 });
 
