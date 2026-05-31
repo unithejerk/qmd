@@ -201,12 +201,12 @@ function resolveEndpoint(
  */
 export function remoteConfigFromEnv(models?: ModelsConfig): RemoteLLMConfig {
   // --- Embed ---
-  // Priority: QMD_EMBED_* env vars > OPENAI_* fallback > empty (local-first)
+  // Priority: QMD_EMBED_* env vars > models.embed_api_* YAML > OPENAI_* fallback > empty (local-first)
   // Empty baseUrl means: fall back to local LlamaCpp embeddings.
   const embed: EndpointConfig = {
-    baseUrl: (process.env.QMD_EMBED_BASE_URL || process.env.OPENAI_BASE_URL || '').replace(/\/+$/, ''),
-    model: process.env.QMD_EMBED_MODEL || '',
-    apiKey: (process.env.QMD_EMBED_API_KEY || process.env.OPENAI_API_KEY || '').trim(),
+    baseUrl: (process.env.QMD_EMBED_BASE_URL || models?.embed_api_url || process.env.OPENAI_BASE_URL || '').replace(/\/+$/, ''),
+    model: process.env.QMD_EMBED_MODEL || models?.embed_api_model || '',
+    apiKey: (process.env.QMD_EMBED_API_KEY || models?.embed_api_key || process.env.OPENAI_API_KEY || '').trim(),
   };
 
   // --- Expand ---

@@ -831,6 +831,9 @@ models:
   embed: hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf
   rerank: hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf
   generate: hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf
+  embed_api_url: http://localhost:11434/v1  # or leave empty for local LlamaCpp
+  embed_api_model: Qwen/Qwen3-Embedding-0.6B
+  embed_api_key: ''  # or set to your API key
   expand_api_url: https://openrouter.ai/api/v1  # or leave empty for local LlamaCpp
   expand_api_model: google/gemini-2.0-flash-lite-001
   expand_api_key: sk-or-...
@@ -845,6 +848,9 @@ models:
 | YAML field | Env var | Default | Description |
 |-----------|---------|---------|-------------|
 | `embed` | `QMD_EMBED_MODEL` | embeddinggemma | Local GGUF model URI for embeddings |
+| `embed_api_url` | `QMD_EMBED_BASE_URL` | *(empty, local)* | Remote embed API base URL |
+| `embed_api_model` | `QMD_EMBED_MODEL` | *(empty, local)* | Remote embed model name |
+| `embed_api_key` | `QMD_EMBED_API_KEY` | — | Bearer token for remote embed API |
 | `rerank` | `QMD_RERANK_MODEL` | qwen3-reranker | Local GGUF model URI for reranking |
 | `generate` | `QMD_GENERATE_MODEL` | qmd-query-expansion | Local GGUF model URI for generation |
 | `expand_api_url` | `QMD_EXPAND_BASE_URL` | *(empty, local)* | Remote expand API base URL |
