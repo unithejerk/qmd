@@ -38,6 +38,7 @@ import {
   anthropicMessagesGenerateAdapter,
 } from './anthropic-messages.js';
 import { cohereV2EmbedAdapter } from './cohere-embed.js';
+import { ollamaEmbedAdapter } from './ollama-embed.js';
 import { cohereRerankAdapter } from './cohere-rerank.js';
 import { vllmScoreAdapter } from './vllm-score.js';
 
@@ -45,7 +46,7 @@ const EMBED_ADAPTERS: Partial<Record<RemoteApiFormat, EmbedAdapter>> = {
   auto: legacyEmbedAdapter,
   openai_v1_embeddings: legacyEmbedAdapter,
   cohere_v2_embed: cohereV2EmbedAdapter,
-  ollama_embed: legacyEmbedAdapter,
+  ollama_embed: ollamaEmbedAdapter,
   vllm_pooling: legacyEmbedAdapter,
 };
 
