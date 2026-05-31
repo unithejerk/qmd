@@ -39,6 +39,14 @@ import type {
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
+import { remoteConfigFromEnv } from "./remote/config.js";
+import {
+  remoteDetokenize,
+  remoteTokenize,
+  remoteTokenizerAvailable,
+  resolveRemoteTokenizerMode,
+  type RemoteTokenizerConfig,
+} from "./remote/tokenizer.js";
 
 // =============================================================================
 // Configuration
@@ -50,6 +58,7 @@ export const DEFAULT_QUERY_MODEL = DEFAULT_GENERATE_MODEL_URI;
 
 /** One-time flag to avoid spamming the chunkDocumentByTokens remote-fallback warning. */
 let _remoteChunkWarningShown = false;
+let _remoteTokenizerWarningShown = false;
 export const DEFAULT_GLOB = "**/*.md";
 export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
@@ -2806,13 +2815,42 @@ export async function chunkDocumentByTokens(
   chunkStrategy: ChunkStrategy = "regex",
   signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
-  if (isRemoteConfigured()) {
-    // Remote LLM has no tokenizer — use character-based chunking with ~3 chars/token estimate.
-    // Result token counts are estimated for compatibility with the return type.
-    // Log once per process to avoid noise during batch embedding.
+  const resolveRemoteTokenizerConfig = (): RemoteTokenizerConfig | null => {
+    const clean = (value: string | undefined): string => (value || '').trim().replace(/\/+$/, '');
+    const envCfg = remoteConfigFromEnv().embed;
+
+    const overrideBaseUrl = clean(process.env.QMD_TOKENIZER_BASE_URL);
+    const overrideModel = (process.env.QMD_TOKENIZER_MODEL || '').trim();
+    const overrideApiKey = (process.env.QMD_TOKENIZER_API_KEY || process.env.OPENAI_API_KEY || '').trim();
+
+    const envBaseUrl = clean(envCfg?.baseUrl);
+    const envModel = (envCfg?.model || '').trim();
+    const envApiKey = (envCfg?.apiKey || '').trim();
+
+    let baseUrl = overrideBaseUrl || envBaseUrl;
+    let model = overrideModel || envModel;
+    let apiKey = overrideApiKey || envApiKey;
+
+    // YAML-only remote setup may not populate env vars. In that case, attempt
+    // to read endpoint config from the currently injected RemoteLLM instance.
+    const defaultLlmUnknown = getDefaultLlamaCpp() as unknown as {
+      embedCfg?: { baseUrl?: string; model?: string; apiKey?: string };
+    };
+    const embedCfg = defaultLlmUnknown?.embedCfg;
+    if ((!baseUrl || !model) && embedCfg) {
+      baseUrl = baseUrl || clean(embedCfg.baseUrl);
+      model = model || (embedCfg.model || '').trim();
+      apiKey = apiKey || (embedCfg.apiKey || '').trim();
+    }
+
+    if (!baseUrl || !model) return null;
+    return { baseUrl, model, apiKey };
+  };
+
+  const fallbackCharChunking = async (reason: string): Promise<{ text: string; pos: number; tokens: number }[]> => {
     if (!_remoteChunkWarningShown) {
       console.warn(
-        'Remote LLM configured — chunkDocumentByTokens using character-based chunking ' +
+        `Remote tokenizer unavailable (${reason}) — chunkDocumentByTokens using character-based chunking ` +
         'with estimated token counts (~3 chars/token). Token counts are approximate.'
       );
       _remoteChunkWarningShown = true;
@@ -2827,9 +2865,130 @@ export async function chunkDocumentByTokens(
       pos: chunk.pos,
       tokens: Math.ceil(chunk.text.length / avgCharsPerToken),
     }));
+  };
+
+  const hasLocalTokenizerApi = (candidate: unknown): candidate is {
+    tokenize: (text: string) => Promise<readonly unknown[]>;
+    detokenize: (tokens: readonly unknown[]) => Promise<string>;
+  } => (
+    !!candidate
+    && typeof candidate === 'object'
+    && typeof (candidate as { tokenize?: unknown }).tokenize === 'function'
+    && typeof (candidate as { detokenize?: unknown }).detokenize === 'function'
+  );
+
+  const tokenizerMode = resolveRemoteTokenizerMode();
+  const defaultLlm = getDefaultLlamaCpp();
+  const remoteMode = isRemoteConfigured() || !hasLocalTokenizerApi(defaultLlm as unknown);
+
+  if (remoteMode) {
+    if (tokenizerMode === 'off') {
+      return fallbackCharChunking('QMD_REMOTE_TOKENIZER=off');
+    }
+
+    const remoteTokenizerCfg = resolveRemoteTokenizerConfig();
+    if (!remoteTokenizerCfg) {
+      if (tokenizerMode === 'force') {
+        throw new Error(
+          'QMD_REMOTE_TOKENIZER=force is set, but remote tokenizer config is missing. ' +
+          'Set QMD_TOKENIZER_BASE_URL/QMD_TOKENIZER_MODEL or QMD_EMBED_BASE_URL/QMD_EMBED_MODEL.'
+        );
+      }
+      return fallbackCharChunking('remote tokenizer config missing');
+    }
+
+    const available = await remoteTokenizerAvailable(remoteTokenizerCfg);
+    if (!available) {
+      if (tokenizerMode === 'force') {
+        throw new Error(
+          `QMD_REMOTE_TOKENIZER=force is set, but tokenizer endpoint is unavailable at ${remoteTokenizerCfg.baseUrl}.`
+        );
+      }
+      return fallbackCharChunking('tokenizer endpoint unavailable');
+    }
+
+    if (!_remoteTokenizerWarningShown) {
+      console.warn(
+        `Remote tokenizer enabled — chunkDocumentByTokens using ${remoteTokenizerCfg.baseUrl}/tokenize ` +
+        'and /detokenize for exact token limits.'
+      );
+      _remoteTokenizerWarningShown = true;
+    }
+
+    const avgCharsPerToken = 3;
+    const maxChars = maxTokens * avgCharsPerToken;
+    const overlapChars = overlapTokens * avgCharsPerToken;
+    const windowChars = windowTokens * avgCharsPerToken;
+
+    const charChunks = await chunkDocumentAsync(content, maxChars, overlapChars, windowChars, filepath, chunkStrategy);
+    const results: { text: string; pos: number; tokens: number }[] = [];
+    const clampOverlapChars = (value: number, maxCharsValue: number): number => {
+      if (maxCharsValue <= 1) return 0;
+      return Math.max(0, Math.min(maxCharsValue - 1, Math.floor(value)));
+    };
+
+    const pushChunkWithinTokenLimit = async (text: string, pos: number): Promise<void> => {
+      if (signal?.aborted) return;
+
+      const tokens = await remoteTokenize(remoteTokenizerCfg, text);
+      if (tokens.length <= maxTokens || text.length <= 1) {
+        results.push({ text, pos, tokens: tokens.length });
+        return;
+      }
+
+      const actualCharsPerToken = text.length / tokens.length;
+      let safeMaxChars = Math.floor(maxTokens * actualCharsPerToken * 0.95);
+      if (!Number.isFinite(safeMaxChars) || safeMaxChars < 1) {
+        safeMaxChars = Math.floor(text.length / 2);
+      }
+      safeMaxChars = Math.max(1, Math.min(text.length - 1, safeMaxChars));
+
+      let nextOverlapChars = clampOverlapChars(
+        overlapChars * actualCharsPerToken / 2,
+        safeMaxChars,
+      );
+      let nextWindowChars = Math.max(0, Math.floor(windowChars * actualCharsPerToken / 2));
+      let subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
+
+      if (
+        subChunks.length <= 1
+        || subChunks[0]?.text.length === text.length
+      ) {
+        safeMaxChars = Math.max(1, Math.floor(text.length / 2));
+        nextOverlapChars = 0;
+        nextWindowChars = 0;
+        subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
+      }
+
+      if (
+        subChunks.length <= 1
+        || subChunks[0]?.text.length === text.length
+      ) {
+        const fallbackTokens = tokens.slice(0, Math.max(1, maxTokens));
+        const truncatedText = await remoteDetokenize(remoteTokenizerCfg, fallbackTokens);
+        results.push({
+          text: truncatedText,
+          pos,
+          tokens: fallbackTokens.length,
+        });
+        return;
+      }
+
+      for (const subChunk of subChunks) {
+        await pushChunkWithinTokenLimit(
+          text.slice(subChunk.pos, subChunk.pos + subChunk.text.length),
+          pos + subChunk.pos,
+        );
+      }
+    };
+
+    for (const chunk of charChunks) {
+      await pushChunkWithinTokenLimit(chunk.text, chunk.pos);
+    }
+    return results;
   }
 
-  const llm = getDefaultLlamaCpp();
+  const llm = defaultLlm;
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
