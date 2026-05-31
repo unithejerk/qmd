@@ -42,18 +42,24 @@ export interface ModelsConfig {
   generate?: string;
 
   // Remote API endpoint configuration (env vars take precedence)
+  //
+  // SECURITY WARNING: Do NOT commit API keys in index.yml.
+  // Prefer environment variables (QMD_EMBED_API_KEY, etc.) over YAML fields.
+  // If you must use YAML keys, add index.yml to .gitignore or use a
+  // gitignored override file. Leaked API keys in version control are a
+  // common security incident vector.
   embed_api_url?: string;    // Remote embed API base URL
   embed_api_model?: string;  // Remote embed model name
-  embed_api_key?: string;    // Bearer token for remote embed API
+  embed_api_key?: string;    // Bearer token for remote embed API (WARNING: use env vars instead!)
   expand_api_url?: string;    // Remote query expansion API base URL
   expand_api_model?: string;  // Remote query expansion model name
-  expand_api_key?: string;    // Bearer token for remote expand API
+  expand_api_key?: string;    // Bearer token for remote expand API (WARNING: use env vars instead!)
   rerank_api_url?: string;    // Remote rerank API base URL
   rerank_api_model?: string;  // Remote rerank model name
-  rerank_api_key?: string;    // Bearer token for remote rerank API
+  rerank_api_key?: string;    // Bearer token for remote rerank API (WARNING: use env vars instead!)
   generate_api_url?: string;  // Remote generation API base URL
   generate_api_model?: string; // Remote generation model name
-  generate_api_key?: string;  // Bearer token for remote generate API
+  generate_api_key?: string;  // Bearer token for remote generate API (WARNING: use env vars instead!)
 }
 
 /**
