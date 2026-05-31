@@ -63,6 +63,12 @@ import {
 } from '../src/remote/adapters/anthropic-messages.js';
 import { cohereV2EmbedAdapter } from '../src/remote/adapters/cohere-embed.js';
 import { ollamaEmbedAdapter } from '../src/remote/adapters/ollama-embed.js';
+import {
+  ollamaChatExpandAdapter,
+  ollamaChatGenerateAdapter,
+  ollamaGenerateExpandAdapter,
+  ollamaGenerateGenerateAdapter,
+} from '../src/remote/adapters/ollama-text.js';
 import { cohereRerankAdapter } from '../src/remote/adapters/cohere-rerank.js';
 import { vllmScoreAdapter } from '../src/remote/adapters/vllm-score.js';
 import { resolveAdapterBundle } from '../src/remote/adapters/registry.js';
@@ -436,6 +442,11 @@ describe('resolveEndpointFormat', () => {
 
   test('normalizes dash/space variants', () => {
     expect(resolveEndpointFormat('expand', 'EXPAND', 'openai-chat')).toBe('openai_chat_completions');
+  });
+
+  test('accepts ollama_chat and ollama_generate for expand/generate roles', () => {
+    expect(resolveEndpointFormat('expand', 'EXPAND', 'ollama_chat')).toBe('ollama_chat');
+    expect(resolveEndpointFormat('generate', 'GENERATE', 'ollama_generate')).toBe('ollama_generate');
   });
 });
 
@@ -1378,6 +1389,28 @@ describe('resolveAdapterBundle', () => {
     expect(bundle.embed.id).toBe('ollama/embed');
   });
 
+  test('ollama_chat resolves to Ollama chat adapters', () => {
+    const bundle = resolveAdapterBundle({
+      embed: ecfg({ format: 'auto' }),
+      expand: ecfg({ format: 'ollama_chat' }),
+      rerank: ecfg({ format: 'auto' }),
+      generate: ecfg({ format: 'ollama_chat' }),
+    });
+    expect(bundle.expand.id).toBe('ollama/chat-expand');
+    expect(bundle.generate.id).toBe('ollama/chat-generate');
+  });
+
+  test('ollama_generate resolves to Ollama generate adapters', () => {
+    const bundle = resolveAdapterBundle({
+      embed: ecfg({ format: 'auto' }),
+      expand: ecfg({ format: 'ollama_generate' }),
+      rerank: ecfg({ format: 'auto' }),
+      generate: ecfg({ format: 'ollama_generate' }),
+    });
+    expect(bundle.expand.id).toBe('ollama/generate-expand');
+    expect(bundle.generate.id).toBe('ollama/generate-generate');
+  });
+
   test('vllm_score resolves to vLLM score adapter', () => {
     const bundle = resolveAdapterBundle({
       embed: ecfg({ format: 'auto' }),
@@ -1688,6 +1721,129 @@ describe('ollamaEmbedAdapter', () => {
     await server.close();
   });
 });
+
+describe('ollama chat/generate adapters', () => {
+  const expandCtx = (url: string) => ({
+    cfg: { baseUrl: url, model: 'llama3.2', apiKey: '', format: 'ollama_chat' as const },
+    breaker: new CircuitBreaker(),
+    log: silentLogger,
+    readTimeoutMs: 5000,
+  });
+
+  const generateCtx = (url: string) => ({
+    cfg: { baseUrl: url, model: 'llama3.2', apiKey: '', format: 'ollama_chat' as const },
+    breaker: new CircuitBreaker(),
+    log: silentLogger,
+    readTimeoutMs: 5000,
+  });
+
+  test('ollamaChatExpandAdapter posts to /api/chat with stream:false and parses variants', async () => {
+    let requestedPath = '';
+    let receivedBody: any = null;
+    const server = startMockServer(async (req, res) => {
+      requestedPath = req.url ?? '';
+      receivedBody = await readBody(req);
+      jsonRes(res, 200, {
+        model: 'llama3.2',
+        message: {
+          role: 'assistant',
+          content: 'lex: sky color\nvec: why sky appears blue\nhyde: A note about why sky appears blue',
+        },
+        done: true,
+      });
+    });
+
+    const result = await ollamaChatExpandAdapter.expandQuery(
+      expandCtx(server.url),
+      'sky blue',
+      {},
+    );
+
+    expect(requestedPath).toBe('/api/chat');
+    expect(receivedBody.stream).toBe(false);
+    expect(receivedBody.messages[0].role).toBe('system');
+    expect(receivedBody.messages[1].role).toBe('user');
+    expect(result.length).toBeGreaterThan(0);
+    await server.close();
+  });
+
+  test('ollamaGenerateExpandAdapter posts to /api/generate and falls back on malformed output', async () => {
+    let requestedPath = '';
+    let receivedBody: any = null;
+    const server = startMockServer(async (req, res) => {
+      requestedPath = req.url ?? '';
+      receivedBody = await readBody(req);
+      jsonRes(res, 200, {
+        model: 'llama3.2',
+        response: 'not parseable',
+        done: true,
+      });
+    });
+
+    const result = await ollamaGenerateExpandAdapter.expandQuery(
+      { ...expandCtx(server.url), cfg: { baseUrl: server.url, model: 'llama3.2', apiKey: '', format: 'ollama_generate' } },
+      'sky blue',
+      {},
+    );
+
+    expect(requestedPath).toBe('/api/generate');
+    expect(receivedBody.stream).toBe(false);
+    expect(typeof receivedBody.system).toBe('string');
+    expect(result).toHaveLength(3); // expandFallback
+    await server.close();
+  });
+
+  test('ollamaChatGenerateAdapter returns assistant message and passes runtime options', async () => {
+    let requestedPath = '';
+    let receivedBody: any = null;
+    const server = startMockServer(async (req, res) => {
+      requestedPath = req.url ?? '';
+      receivedBody = await readBody(req);
+      jsonRes(res, 200, {
+        model: 'llama3.2',
+        message: { role: 'assistant', content: 'hello from chat' },
+        done: true,
+      });
+    });
+
+    const result = await ollamaChatGenerateAdapter.generate(
+      generateCtx(server.url),
+      'hello',
+      { maxTokens: 42, temperature: 0.3 },
+    );
+
+    expect(requestedPath).toBe('/api/chat');
+    expect(receivedBody.options.num_predict).toBe(42);
+    expect(receivedBody.options.temperature).toBe(0.3);
+    expect(result!.text).toBe('hello from chat');
+    expect(result!.done).toBe(true);
+    await server.close();
+  });
+
+  test('ollamaGenerateGenerateAdapter returns response text and hits /api/generate', async () => {
+    let requestedPath = '';
+    const server = startMockServer((_req, res) => {
+      requestedPath = _req.url ?? '';
+      jsonRes(res, 200, {
+        model: 'llama3.2',
+        response: 'hello from generate',
+        done: true,
+      });
+    });
+
+    const result = await ollamaGenerateGenerateAdapter.generate(
+      { ...generateCtx(server.url), cfg: { baseUrl: server.url, model: 'llama3.2', apiKey: '', format: 'ollama_generate' } },
+      'hello',
+      {},
+    );
+
+    expect(requestedPath).toBe('/api/generate');
+    expect(result!.text).toBe('hello from generate');
+    expect(result!.done).toBe(true);
+    await server.close();
+  });
+});
+
 describe('cohereRerankAdapter', () => {
   function makeCtx(url: string): Parameters<typeof cohereRerankAdapter.rerank>[0] {
     return {
@@ -2527,6 +2683,63 @@ describe('RemoteLLM with Phase 4 cohere formats', () => {
     expect(result[0]!.embedding).toEqual(mockEmbedding);
     expect(requestedPath).toBe('/api/embed');
     expect(receivedBody.input).toEqual(['hello']);
+
+    await llm.dispose();
+    await server.close();
+  });
+
+  test('RemoteLLM expandQuery uses ollama_chat adapter and /api/chat path', async () => {
+    let requestedPath = '';
+    let receivedBody: any = null;
+    const server = startMockServer(async (req, res) => {
+      requestedPath = req.url ?? '';
+      receivedBody = await readBody(req);
+      jsonRes(res, 200, {
+        model: 'llama3.2',
+        message: {
+          role: 'assistant',
+          content: 'lex: hello world\nvec: hello semantic\nhyde: A note about hello world',
+        },
+        done: true,
+      });
+    });
+
+    const llm = new RemoteLLM({
+      expand: { baseUrl: server.url, model: 'llama3.2', apiKey: '', format: 'ollama_chat' },
+    }, silentLogger);
+
+    const result = await llm.expandQuery('hello world');
+    expect(result.length).toBeGreaterThan(0);
+    expect(requestedPath).toBe('/api/chat');
+    expect(receivedBody.stream).toBe(false);
+
+    await llm.dispose();
+    await server.close();
+  });
+
+  test('RemoteLLM generate uses ollama_generate adapter and /api/generate path', async () => {
+    let requestedPath = '';
+    let receivedBody: any = null;
+    const server = startMockServer(async (req, res) => {
+      requestedPath = req.url ?? '';
+      receivedBody = await readBody(req);
+      jsonRes(res, 200, {
+        model: 'llama3.2',
+        response: 'generated text',
+        done: true,
+      });
+    });
+
+    const llm = new RemoteLLM({
+      generate: { baseUrl: server.url, model: 'llama3.2', apiKey: '', format: 'ollama_generate' },
+    }, silentLogger);
+
+    const result = await llm.generate('hello', { maxTokens: 16, temperature: 0.4 });
+    expect(result!.text).toBe('generated text');
+    expect(result!.done).toBe(true);
+    expect(requestedPath).toBe('/api/generate');
+    expect(receivedBody.options.num_predict).toBe(16);
+    expect(receivedBody.options.temperature).toBe(0.4);
 
     await llm.dispose();
     await server.close();
