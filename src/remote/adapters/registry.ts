@@ -1,9 +1,9 @@
 /**
  * Adapter registry and resolver.
  *
- * Phase 1 keeps behavior stable by routing all currently supported formats to
- * legacy adapters, while centralizing selection logic in one place so future
- * protocol-specific adapters can be added without editing RemoteLLM.
+ * Phase 1 kept behavior stable by routing all formats to legacy adapters.
+ * Phase 2 wires OpenAI-specific protocol adapters while keeping `auto` and
+ * `anthropic_messages` on legacy paths for backward compatibility.
  */
 
 import type { RemoteApiFormat } from '../../collections.js';
@@ -21,6 +21,18 @@ import {
   legacyGenerateAdapter,
   legacyRerankAdapter,
 } from './legacy.js';
+import {
+  openaiChatCompletionsExpandAdapter,
+  openaiChatCompletionsGenerateAdapter,
+} from './openai-chat.js';
+import {
+  openaiCompletionsExpandAdapter,
+  openaiCompletionsGenerateAdapter,
+} from './openai-completions.js';
+import {
+  openaiResponsesExpandAdapter,
+  openaiResponsesGenerateAdapter,
+} from './openai-responses.js';
 
 const EMBED_ADAPTERS: Partial<Record<RemoteApiFormat, EmbedAdapter>> = {
   auto: legacyEmbedAdapter,
@@ -32,9 +44,9 @@ const EMBED_ADAPTERS: Partial<Record<RemoteApiFormat, EmbedAdapter>> = {
 
 const EXPAND_ADAPTERS: Partial<Record<RemoteApiFormat, ExpandAdapter>> = {
   auto: legacyExpandAdapter,
-  openai_chat_completions: legacyExpandAdapter,
-  openai_completions: legacyExpandAdapter,
-  openai_responses: legacyExpandAdapter,
+  openai_chat_completions: openaiChatCompletionsExpandAdapter,
+  openai_completions: openaiCompletionsExpandAdapter,
+  openai_responses: openaiResponsesExpandAdapter,
   anthropic_messages: legacyExpandAdapter,
 };
 
@@ -47,9 +59,9 @@ const RERANK_ADAPTERS: Partial<Record<RemoteApiFormat, RerankAdapter>> = {
 
 const GENERATE_ADAPTERS: Partial<Record<RemoteApiFormat, GenerateAdapter>> = {
   auto: legacyGenerateAdapter,
-  openai_chat_completions: legacyGenerateAdapter,
-  openai_completions: legacyGenerateAdapter,
-  openai_responses: legacyGenerateAdapter,
+  openai_chat_completions: openaiChatCompletionsGenerateAdapter,
+  openai_completions: openaiCompletionsGenerateAdapter,
+  openai_responses: openaiResponsesGenerateAdapter,
   anthropic_messages: legacyGenerateAdapter,
 };
 
