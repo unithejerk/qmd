@@ -18,7 +18,8 @@ import { syncConfigToDb } from "../../src/store/config-sync.js";
 import { reindexCollection } from "../../src/store/reindex.js";
 import { getEmbeddingFingerprint, getHashesNeedingEmbedding } from "../../src/store/embedding-pipeline.js";
 import { getIndexHealth } from "../../src/store/cleanup.js";
-import { formatQueryForEmbedding, formatDocForEmbedding } from "../../src/llm.js";
+import { hashContent, insertContent, insertDocument } from "../../src/store/document-ops.js";
+import { DEFAULT_EMBED_MODEL_URI, formatQueryForEmbedding, formatDocForEmbedding } from "../../src/llm.js";
 import { hybridQuery, vectorSearchQuery, structuredSearch } from "../../src/store/query-engine.js";
 import * as llmModule from "../../src/llm.js";
 import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../../src/llm.js";
@@ -199,17 +200,17 @@ afterAll(async () => {
 
 describe("Embedding Formatting", () => {
   test("formatQueryForEmbedding adds search task prefix", () => {
-    const formatted = formatQueryForEmbedding("how to deploy");
+    const formatted = formatQueryForEmbedding("how to deploy", DEFAULT_EMBED_MODEL_URI);
     expect(formatted).toBe("task: search result | query: how to deploy");
   });
 
   test("formatDocForEmbedding adds title and text prefix", () => {
-    const formatted = formatDocForEmbedding("Some content", "My Title");
+    const formatted = formatDocForEmbedding("Some content", "My Title", DEFAULT_EMBED_MODEL_URI);
     expect(formatted).toBe("title: My Title | text: Some content");
   });
 
   test("formatDocForEmbedding handles missing title", () => {
-    const formatted = formatDocForEmbedding("Some content");
+    const formatted = formatDocForEmbedding("Some content", undefined, DEFAULT_EMBED_MODEL_URI);
     expect(formatted).toBe("title: none | text: Some content");
   });
 });

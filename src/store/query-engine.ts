@@ -494,6 +494,10 @@ export interface StoreQueryApi {
   rerankModelName?: string;
 }
 
+function resolveStoreEmbedModel(store: StoreQueryApi): string {
+  return store.llm?.embedModelName ?? store.embedModelName ?? DEFAULT_EMBED_MODEL_URI;
+}
+
 /**
  * Hybrid search: BM25 + vector + query expansion + RRF + chunked reranking.
  */
@@ -573,7 +577,7 @@ export async function hybridQuery(
       }
     }
 
-    const embedModel = store.embedModelName ?? DEFAULT_EMBED_MODEL_URI;
+    const embedModel = resolveStoreEmbedModel(store);
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
@@ -810,10 +814,10 @@ export async function vectorSearchQuery(
   const vecExpanded = allExpanded.filter(q => q.type !== 'lex');
   options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
 
-  const embedModel = store.embedModelName ?? DEFAULT_EMBED_MODEL_URI;
+  const embedModel = resolveStoreEmbedModel(store);
   const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const textsToEmbed = queryTexts.map(q => formatQueryForEmbedding(q, embedModel));
-  const llm = getStoreLlm();
+  const llm = getStoreLlm(store.llm);
   const embeddings = await llm.embedBatch(textsToEmbed, { model: embedModel, isQuery: true });
   const allResults = new Map<string, VectorSearchResult>();
   const retrievalOptions: SearchResultOptions = { includeBody: false, includeContext: false };
@@ -947,7 +951,7 @@ export async function structuredSearch(
         s.type === 'vec' || s.type === 'hyde'
     );
     if (vecSearches.length > 0) {
-      const embedModel = store.embedModelName ?? DEFAULT_EMBED_MODEL_URI;
+      const embedModel = resolveStoreEmbedModel(store);
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
