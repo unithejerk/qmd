@@ -5,7 +5,7 @@
  * Run with: bun test store/infrastructure.test.ts
  */
 
-import { describe, test, expect, beforeAll, afterAll, vi } from "vitest";
+import { describe, test, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
 import { createStore, generateEmbeddings } from "../../src/store.js";
 import type { Store, CollectionConfig, SearchResult } from "../../src/store.js";
 import type { Database } from "../../src/db.js";
@@ -475,38 +475,38 @@ describe("Index Status", () => {
 // Embedding batching tests
 // =============================================================================
 
+function createFakeTokenizer() {
+  return {
+    async tokenize(text: string) {
+      return new Array(Math.max(1, Math.ceil(text.length / 16))).fill(1);
+    },
+  };
+}
+
+function createFakeEmbedLlm() {
+  const embedBatchCalls: string[][] = [];
+  const embedCalls: { text: string; options?: { model?: string } }[] = [];
+  const embedBatchModelCalls: ({ model?: string } | undefined)[] = [];
+  return {
+    embedBatchCalls,
+    embedCalls,
+    embedBatchModelCalls,
+    async embed(text: string, options?: { model?: string }) {
+      embedCalls.push({ text, options });
+      return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
+    },
+    async embedBatch(texts: string[], options?: { model?: string }) {
+      embedBatchCalls.push([...texts]);
+      embedBatchModelCalls.push(options);
+      return texts.map((_text, index) => ({
+        embedding: [index + 1, index + 2, index + 3],
+        model: "fake-embed",
+      }));
+    },
+  };
+}
+
 describe("Embedding batching", () => {
-  function createFakeTokenizer() {
-    return {
-      async tokenize(text: string) {
-        return new Array(Math.max(1, Math.ceil(text.length / 16))).fill(1);
-      },
-    };
-  }
-
-  function createFakeEmbedLlm() {
-    const embedBatchCalls: string[][] = [];
-    const embedCalls: { text: string; options?: { model?: string } }[] = [];
-    const embedBatchModelCalls: ({ model?: string } | undefined)[] = [];
-    return {
-      embedBatchCalls,
-      embedCalls,
-      embedBatchModelCalls,
-      async embed(text: string, options?: { model?: string }) {
-        embedCalls.push({ text, options });
-        return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
-      },
-      async embedBatch(texts: string[], options?: { model?: string }) {
-        embedBatchCalls.push([...texts]);
-        embedBatchModelCalls.push(options);
-        return texts.map((_text, index) => ({
-          embedding: [index + 1, index + 2, index + 3],
-          model: "fake-embed",
-        }));
-      },
-    };
-  }
-
   test("generateEmbeddings flushes batches when maxDocsPerBatch is reached", async () => {
     const store = await createTestStore();
     const db = store.db;
@@ -825,6 +825,169 @@ describe("Embedding batching", () => {
         "maxBatchBytes"
       );
     } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+});
+
+// =============================================================================
+// Embedding Session Timeout Tests
+// =============================================================================
+
+describe("Embedding Session Timeout", () => {
+  const ENV_VAR = "QMD_EMBED_SESSION_MAX_DURATION_MS";
+  const DEFAULT_MS = 30 * 60 * 1000;
+
+  afterEach(() => {
+    delete process.env[ENV_VAR];
+  });
+
+  test("default timeout is 30 minutes", async () => {
+    const store = await createTestStore();
+    const fakeLlm = createFakeEmbedLlm();
+    const sessionSpy = vi.spyOn(llmModule, "withLLMSessionForLlm");
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(store.db, "docs", { name: "one", body: "# One\n\nAlpha" });
+      await generateEmbeddings(store);
+
+      expect(sessionSpy).toHaveBeenCalledWith(
+        fakeLlm,
+        expect.any(Function),
+        expect.objectContaining({ maxDuration: DEFAULT_MS, name: "generateEmbeddings" }),
+      );
+    } finally {
+      sessionSpy.mockRestore();
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("env var override is used when set to a positive integer", async () => {
+    process.env[ENV_VAR] = "5000";
+    const store = await createTestStore();
+    const fakeLlm = createFakeEmbedLlm();
+    const sessionSpy = vi.spyOn(llmModule, "withLLMSessionForLlm");
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(store.db, "docs", { name: "one", body: "# One\n\nAlpha" });
+      await generateEmbeddings(store);
+
+      expect(sessionSpy).toHaveBeenCalledWith(
+        fakeLlm,
+        expect.any(Function),
+        expect.objectContaining({ maxDuration: 5000, name: "generateEmbeddings" }),
+      );
+    } finally {
+      sessionSpy.mockRestore();
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("invalid env var (non-numeric) falls back to default", async () => {
+    process.env[ENV_VAR] = "not-a-number";
+    const store = await createTestStore();
+    const fakeLlm = createFakeEmbedLlm();
+    const sessionSpy = vi.spyOn(llmModule, "withLLMSessionForLlm");
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(store.db, "docs", { name: "one", body: "# One\n\nAlpha" });
+      await generateEmbeddings(store);
+
+      expect(sessionSpy).toHaveBeenCalledWith(
+        fakeLlm,
+        expect.any(Function),
+        expect.objectContaining({ maxDuration: DEFAULT_MS, name: "generateEmbeddings" }),
+      );
+    } finally {
+      sessionSpy.mockRestore();
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("invalid env var (zero) falls back to default", async () => {
+    process.env[ENV_VAR] = "0";
+    const store = await createTestStore();
+    const fakeLlm = createFakeEmbedLlm();
+    const sessionSpy = vi.spyOn(llmModule, "withLLMSessionForLlm");
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(store.db, "docs", { name: "one", body: "# One\n\nAlpha" });
+      await generateEmbeddings(store);
+
+      expect(sessionSpy).toHaveBeenCalledWith(
+        fakeLlm,
+        expect.any(Function),
+        expect.objectContaining({ maxDuration: DEFAULT_MS, name: "generateEmbeddings" }),
+      );
+    } finally {
+      sessionSpy.mockRestore();
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("invalid env var (negative) falls back to default", async () => {
+    process.env[ENV_VAR] = "-1";
+    const store = await createTestStore();
+    const fakeLlm = createFakeEmbedLlm();
+    const sessionSpy = vi.spyOn(llmModule, "withLLMSessionForLlm");
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(store.db, "docs", { name: "one", body: "# One\n\nAlpha" });
+      await generateEmbeddings(store);
+
+      expect(sessionSpy).toHaveBeenCalledWith(
+        fakeLlm,
+        expect.any(Function),
+        expect.objectContaining({ maxDuration: DEFAULT_MS, name: "generateEmbeddings" }),
+      );
+    } finally {
+      sessionSpy.mockRestore();
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("empty string env var uses default", async () => {
+    process.env[ENV_VAR] = "";
+    const store = await createTestStore();
+    const fakeLlm = createFakeEmbedLlm();
+    const sessionSpy = vi.spyOn(llmModule, "withLLMSessionForLlm");
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(store.db, "docs", { name: "one", body: "# One\n\nAlpha" });
+      await generateEmbeddings(store);
+
+      expect(sessionSpy).toHaveBeenCalledWith(
+        fakeLlm,
+        expect.any(Function),
+        expect.objectContaining({ maxDuration: DEFAULT_MS, name: "generateEmbeddings" }),
+      );
+    } finally {
+      sessionSpy.mockRestore();
       setDefaultLlamaCpp(null);
       await cleanupTestDb(store);
     }

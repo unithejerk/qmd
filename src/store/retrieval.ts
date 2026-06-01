@@ -521,6 +521,13 @@ function buildFTS5Query(query: string): string | null {
           if (negated) negative.push(ftsPhrase);
           else positive.push(ftsPhrase);
         }
+      } else if (/^[\d]+\.[\d.]+$/.test(term)) {
+        // Dotted version token (e.g. 2026.4.10) — replace dots with spaces
+        // so FTS5 matches it as an exact phrase of adjacent tokens.
+        const phrase = term.replace(/\./g, ' ');
+        const ftsPhrase = `"${phrase}"`;
+        if (negated) negative.push(ftsPhrase);
+        else positive.push(ftsPhrase);
       } else {
         const sanitized = sanitizeFTS5Term(term);
         if (sanitized) {

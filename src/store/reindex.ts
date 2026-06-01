@@ -7,6 +7,7 @@
 import fastGlob from "fast-glob";
 import { readFileSync, statSync } from "node:fs";
 import { getRealPath, resolve } from "./path-utils.js";
+import { splitTopLevelCommaPatterns } from "../glob-patterns.js";
 import {
   deactivateDocument,
   extractTitle,
@@ -64,7 +65,9 @@ export async function reindexCollection(
     ...excludeDirs.map(d => `**/${d}/**`),
     ...(options?.ignorePatterns || []),
   ];
-  const allFiles: string[] = await fastGlob(globPattern, {
+  const patterns = splitTopLevelCommaPatterns(globPattern);
+  const fastGlobInput = patterns.length === 1 ? patterns[0]! : patterns;
+  const allFiles: string[] = await fastGlob(fastGlobInput, {
     cwd: collectionPath,
     onlyFiles: true,
     followSymbolicLinks: false,

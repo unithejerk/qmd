@@ -498,6 +498,43 @@ describe("CLI Add Command", () => {
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Collection 'fixtures' created successfully");
   });
+
+  test("fails with usage when no path is provided", async () => {
+    const { stderr, exitCode } = await runQmd(["collection", "add"]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Usage: qmd collection add");
+  });
+
+  test("adds files with comma-separated mask patterns", async () => {
+    const { dbPath, configDir } = await createIsolatedTestEnv("comma-mask");
+    const { stdout, stderr, exitCode } = await runQmd(["collection", "add", ".", "--mask", "README.md,test1.md"], { dbPath, configDir });
+    if (exitCode !== 0) {
+      console.error("Command failed:", stderr);
+    }
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Indexed:");
+    // Should find both README.md and test1.md
+    expect(stdout).toContain("2 new");
+  });
+
+  test("does not split commas inside character classes", async () => {
+    const { dbPath, configDir } = await createIsolatedTestEnv("charclass-mask");
+    const { stdout, stderr, exitCode } = await runQmd(["collection", "add", ".", "--mask", "README[,.]md,test1.md"], { dbPath, configDir });
+    if (exitCode !== 0) {
+      console.error("Command failed:", stderr);
+    }
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Indexed:");
+    expect(stdout).toContain("2 new");
+    expect(stderr).not.toContain("No files matched the mask pattern(s)");
+  });
+
+  test("warns on comma-separated mask with zero matches", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["collection", "add", ".", "--mask", "nonexistent1.md,nonexistent2.md"]);
+    // collection add still succeeds (creates empty collection, 0 files indexed)
+    expect(exitCode).toBe(0);
+    expect(stderr).toContain("No files matched the mask pattern(s)");
+  });
 });
 
 describe("CLI Status Command", () => {
@@ -947,6 +984,39 @@ describe("CLI Update Command", () => {
     const { stdout, exitCode } = await runQmd(["update"], { dbPath: localDbPath });
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Updating");
+  });
+
+  test("update -c <name> scopes to a single collection", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["update", "-c", "fixtures"], { dbPath: localDbPath });
+    if (exitCode !== 0) {
+      console.error("Command failed:", stderr);
+    }
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Updating 1 collection(s)");
+    expect(stdout).toContain("fixtures");
+  });
+
+  test("update -c supports multiple collection filters", async () => {
+    const notesAdd = await runQmd(["collection", "add", ".", "--name", "notes", "--mask", "notes/*.md"], { dbPath: localDbPath });
+    expect(notesAdd.exitCode).toBe(0);
+    const docsAdd = await runQmd(["collection", "add", ".", "--name", "docs", "--mask", "docs/*.md"], { dbPath: localDbPath });
+    expect(docsAdd.exitCode).toBe(0);
+
+    const { stdout, stderr, exitCode } = await runQmd(["update", "-c", "notes", "-c", "docs"], { dbPath: localDbPath });
+    if (exitCode !== 0) {
+      console.error("Command failed:", stderr);
+    }
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Updating 2 collection(s)");
+    expect(stdout).toContain("notes");
+    expect(stdout).toContain("docs");
+    expect(stdout).not.toContain("[3/");
+  });
+
+  test("update -c nonexistent exits with error", async () => {
+    const { stderr, exitCode } = await runQmd(["update", "-c", "nonexistent"], { dbPath: localDbPath });
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("Collection not found");
   });
 
   test("deactivates stale docs when collection has zero matching files", async () => {

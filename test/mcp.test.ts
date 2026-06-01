@@ -1121,4 +1121,43 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(hit.line).toBe(301);
     expect(hit.snippet).toMatch(/^\d+: @@ -3\d\d,/);
   });
+
+  // ---------------------------------------------------------------------------
+  // REST /query endpoint — canonical qmd:// paths
+  // ---------------------------------------------------------------------------
+
+  test("POST /query returns canonical qmd:// file paths", async () => {
+    const res = await fetch(`${baseUrl}/query`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        searches: [{ type: "lex", query: "readme" }],
+        limit: 5,
+        rerank: false,
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    const body = await res.json();
+    expect(body.results).toBeDefined();
+    expect(body.results.length).toBeGreaterThan(0);
+
+    // Verify each result has a canonical qmd:// file path
+    for (const result of body.results) {
+      expect(result.file).toBeDefined();
+      expect(result.file).toMatch(/^qmd:\/\//);
+    }
+
+    // The specific result for "readme" should be qmd://docs/readme.md
+    const readmeResult = body.results.find((r: any) => r.file === "qmd://docs/readme.md");
+    expect(readmeResult).toBeDefined();
+
+    // Verify all expected fields are present
+    expect(body.results[0]).toHaveProperty("docid");
+    expect(body.results[0]).toHaveProperty("title");
+    expect(body.results[0]).toHaveProperty("score");
+    expect(body.results[0]).toHaveProperty("line");
+    expect(body.results[0]).toHaveProperty("snippet");
+  });
 });

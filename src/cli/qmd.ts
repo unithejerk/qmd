@@ -6,6 +6,7 @@ import { basename, dirname, join as pathJoin, relative as relativePath, resolve 
 import { parseArgs } from "util";
 import { readFileSync, readdirSync, realpathSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync, lstatSync, rmSync, symlinkSync, readlinkSync, copyFileSync } from "fs";
 import { createInterface } from "readline/promises";
+import { splitTopLevelCommaPatterns } from "../glob-patterns.js";
 import {
   getPwd,
   getRealPath,
@@ -633,7 +634,7 @@ async function showStatus(): Promise<void> {
   closeDb();
 }
 
-async function updateCollections(): Promise<void> {
+async function updateCollections(collectionNames?: string[]): Promise<void> {
   const db = getDb();
   const storeInstance = getStore();
   // Collections are defined in YAML; no duplicate cleanup needed.
@@ -641,7 +642,30 @@ async function updateCollections(): Promise<void> {
   // Clear Ollama cache on update
   clearCache(db);
 
-  const collections = listCollections(db);
+  let collections = listCollections(db);
+
+  if (collectionNames && collectionNames.length > 0) {
+    // Validate requested collections exist in YAML.
+    for (const name of collectionNames) {
+      const yamlColl = getCollectionFromYaml(name);
+      if (!yamlColl) {
+        console.error(`${c.yellow}Collection not found: ${name}${c.reset}`);
+        console.error(`Run 'qmd collection list' to see available collections.`);
+        process.exit(1);
+      }
+    }
+
+    // Filter to requested collection set only.
+    const requested = new Set(collectionNames);
+    collections = collections.filter((collection) => requested.has(collection.name));
+
+    if (collections.length === 0) {
+      const names = collectionNames.join(", ");
+      console.log(`${c.dim}Collection(s) '${names}' exist in config but have no indexed files. Run 'qmd collection add <path>' first.${c.reset}`);
+      closeDb();
+      return;
+    }
+  }
 
   if (collections.length === 0) {
     console.log(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
@@ -2399,10 +2423,39 @@ if (isMain) {
         }
 
         case "add": {
-          const pwd = cli.args[1] || getPwd();
+          if (cli.args.length < 2) {
+            console.error("Usage: qmd collection add <path> [--name <name>] [--mask <pattern>]");
+            console.error("");
+            console.error("Examples:");
+            console.error("  qmd collection add .");
+            console.error("  qmd collection add ~/Documents/notes --name notes");
+            console.error("  qmd collection add . --mask '**/*.md'");
+            process.exit(1);
+          }
+          const pwd = cli.args[1]!;
           const resolvedPwd = pwd === '.' ? getPwd() : getRealPath(resolve(pwd));
           const globPattern = cli.values.mask as string || DEFAULT_GLOB;
           const name = cli.values.name as string | undefined;
+
+          // Pre-check for comma-separated mask patterns (e.g., "notes/*.md,docs/*.md").
+          // Warn if no files match across all patterns.
+          const patterns = splitTopLevelCommaPatterns(globPattern);
+          if (patterns.length > 1) {
+            const { default: fastGlob } = await import("fast-glob");
+            let matchCount = 0;
+            for (const pattern of patterns) {
+              const matches = await fastGlob(pattern, {
+                cwd: resolvedPwd,
+                onlyFiles: true,
+                dot: false,
+              });
+              matchCount += matches.length;
+            }
+            if (matchCount === 0) {
+              console.error(`${c.yellow}Warning: No files matched the mask pattern(s): ${globPattern}${c.reset}`);
+              console.error(`  ${c.dim}Check your --mask pattern. Use '**/*.md' to match all markdown files recursively.${c.reset}`);
+            }
+          }
 
           await collectionAdd(resolvedPwd, globPattern, name);
           break;
@@ -2554,7 +2607,7 @@ if (isMain) {
     }
 
     case "update":
-      await updateCollections();
+      await updateCollections(resolveCollectionFilter(cli.opts.collection, false));
       break;
 
     case "embed":

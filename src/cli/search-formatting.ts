@@ -93,10 +93,14 @@ const DEFAULT_EDITOR_URI_TEMPLATE = "vscode://file/{path}:{line}:{col}";
 
 // Build FTS5 query: phrase-aware with fallback to individual terms
 export function buildFTS5Query(query: string): string {
-  // Sanitize the full query for phrase matching
-  const sanitizedQuery = query.replace(/[^\w\s']/g, '').trim();
+  // Replace dots in version patterns (e.g., "2026.4.10") with spaces so FTS5
+  // can match them as an exact phrase of adjacent tokens.
+  const versionNormalized = query.replace(/(\d+\.\d[\d.]*)/g, (m) => m.replace(/\./g, ' '));
 
-  const terms = query
+  // Sanitize the full query for phrase matching
+  const sanitizedQuery = versionNormalized.replace(/[^\w\s']/g, '').trim();
+
+  const terms = versionNormalized
     .split(/\s+/)
     .map(sanitizeFTS5Term)
     .filter(term => term.length >= 2); // Skip single chars and empty

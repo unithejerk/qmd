@@ -468,6 +468,26 @@ export function getStoreLlm(llm?: LLM): LLM {
 }
 
 /**
+ * Read the embed session max duration from the environment, falling back to
+ * the default 30-minute timeout.
+ */
+function resolveEmbedMaxDuration(): number {
+  const DEFAULT_MS = 30 * 60 * 1000;
+  const raw = process.env.QMD_EMBED_SESSION_MAX_DURATION_MS;
+  if (raw === undefined || raw === '') {
+    return DEFAULT_MS;
+  }
+  const parsed = parseInt(raw, 10);
+  if (isNaN(parsed) || parsed <= 0) {
+    process.stderr.write(
+      `Warning: QMD_EMBED_SESSION_MAX_DURATION_MS="${raw}" is not a valid positive integer; using default 30 minutes\n`
+    );
+    return DEFAULT_MS;
+  }
+  return parsed;
+}
+
+/**
  * Generate vector embeddings for documents that need them.
  * Pure function — no console output, no db lifecycle management.
  *
@@ -509,6 +529,7 @@ export async function generateEmbeddings(
   const startTime = Date.now();
 
   const embedModelUri = model;
+  const embedMaxDuration = resolveEmbedMaxDuration();
 
   const result = await withLLMSessionForLlm(llm, async (session) => {
     let chunksEmbedded = 0;
@@ -721,7 +742,7 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
-  }, { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings' });
+  }, { maxDuration: embedMaxDuration, name: 'generateEmbeddings' });
 
   return {
     docsProcessed: totalDocs,

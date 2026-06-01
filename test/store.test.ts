@@ -911,6 +911,66 @@ describe("FTS Search", () => {
 
     await cleanupTestDb(store);
   });
+
+  test("searchFTS matches dotted version tokens as phrases", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "release-notes",
+      title: "Release Notes",
+      body: "version 2026.4.10 is released with many improvements",
+      displayPath: "test/release.md",
+    });
+    await addNoiseDocuments(store.db, collectionName);
+
+    // Full dotted version should match
+    const results = store.searchFTS("2026.4.10", 10);
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0]!.displayPath).toBe(`${collectionName}/test/release.md`);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchFTS with dotted version still returns normal text results", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "mixed",
+      title: "Mixed Content",
+      body: "version 2026.4.10 introduces new features like improved search",
+      displayPath: "test/mixed.md",
+    });
+    await addNoiseDocuments(store.db, collectionName);
+
+    // Normal text query should still work alongside version data
+    const results = store.searchFTS("search", 10);
+    expect(results.length).toBeGreaterThan(0);
+    expect(results.some(r => r.displayPath === `${collectionName}/test/mixed.md`)).toBe(true);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchFTS partial dotted version still matches", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "versioned",
+      title: "Versioned Doc",
+      body: "this references version 4.10 of the protocol",
+      displayPath: "test/versioned.md",
+    });
+    await addNoiseDocuments(store.db, collectionName);
+
+    // Partial version "4.10" should still find the document
+    const results = store.searchFTS("4.10", 10);
+    expect(results.length).toBeGreaterThan(0);
+    expect(results.some(r => r.displayPath === `${collectionName}/test/versioned.md`)).toBe(true);
+
+    await cleanupTestDb(store);
+  });
 });
 
 // =============================================================================
