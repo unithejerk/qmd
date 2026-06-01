@@ -4,7 +4,9 @@ import { join } from "path";
 
 describe("LLM module loading", () => {
   test("node-llama-cpp is only dynamically imported by LLM operations", () => {
-    const source = readFileSync(join(process.cwd(), "src", "llm.ts"), "utf-8");
+    // The lazy-load guarantee now lives in src/llm/llama-cpp.ts where
+    // loadNodeLlamaCpp() dynamically imports node-llama-cpp at runtime.
+    const source = readFileSync(join(process.cwd(), "src", "llm", "llama-cpp.ts"), "utf-8");
 
     expect(source).not.toMatch(/import\s+(?!type\b)[\s\S]*?from\s+["']node-llama-cpp["']/);
     expect(source).toContain('import("node-llama-cpp")');

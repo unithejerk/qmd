@@ -10,7 +10,7 @@ import { openDatabase, loadSqliteVec } from "../src/db.js";
 import type { Database } from "../src/db.js";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm";
+import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm/singleton.js";
 import { unlinkSync } from "node:fs";
 import { mkdtemp, writeFile, readdir, unlink, rmdir } from "node:fs/promises";
 import { join } from "node:path";
@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import YAML from "yaml";
 import type { CollectionConfig } from "../src/collections";
 import { setConfigIndexName } from "../src/collections";
-import { syncConfigToDb } from "../src/store";
+import { syncConfigToDb } from "../src/store/config-sync.js";
 
 // =============================================================================
 // Test Database Setup
@@ -202,23 +202,27 @@ function seedTestData(db: Database): void {
 import {
   searchFTS,
   searchVec,
-  expandQuery,
-  rerank,
-  reciprocalRankFusion,
   extractSnippet,
   getContextForFile,
   findDocument,
   getDocumentBody,
   findDocuments,
   getStatus,
+} from "../src/store/retrieval.js";
+import {
+  expandQuery,
+  rerank,
+  reciprocalRankFusion,
+} from "../src/store/query-engine.js";
+import { getEmbeddingFingerprint } from "../src/store/embedding-pipeline.js";
+import type { RankedResult } from "../src/store/retrieval.js";
+import {
+  createStore,
   DEFAULT_EMBED_MODEL,
-  getEmbeddingFingerprint,
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
-  createStore,
-} from "../src/store";
-import type { RankedResult } from "../src/store";
+} from "../src/store.js";
 // Note: searchResultsToMcpCsv no longer used in MCP - using structuredContent instead
 
 // =============================================================================
@@ -896,8 +900,8 @@ describe("MCP Server", () => {
 // HTTP Transport Tests
 // =============================================================================
 
-import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp/server";
-import { enableProductionMode } from "../src/store";
+import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp/transports/http.js";
+import { enableProductionMode } from "../src/store/path-utils.js";
 
 describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
   let handle: HttpServerHandle;

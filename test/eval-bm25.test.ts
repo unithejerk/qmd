@@ -14,10 +14,9 @@ import { fileURLToPath } from "url";
 
 import {
   createStore,
-  searchFTS,
-  insertDocument,
-  insertContent,
 } from "../src/store";
+import { searchFTS } from "../src/store/retrieval.js";
+import { insertDocument, insertContent } from "../src/store/document-ops.js";
 
 // Set INDEX_PATH before importing store to prevent using global index
 const tempDir = mkdtempSync(join(tmpdir(), "qmd-eval-unit-"));

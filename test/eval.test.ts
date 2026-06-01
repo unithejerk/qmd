@@ -26,17 +26,16 @@ process.env.INDEX_PATH = join(tempDir, "eval.sqlite");
 
 import {
   createStore,
-  searchFTS,
-  searchVec,
-  insertDocument,
-  insertContent,
-  insertEmbedding,
-  chunkDocumentByTokens,
-  reciprocalRankFusion,
   DEFAULT_EMBED_MODEL,
-  type RankedResult,
 } from "../src/store";
-import { getDefaultLlamaCpp, formatDocForEmbedding, disposeDefaultLlamaCpp } from "../src/llm";
+import { searchFTS, searchVec } from "../src/store/retrieval.js";
+import type { RankedResult } from "../src/store/retrieval.js";
+import { insertDocument, insertContent } from "../src/store/document-ops.js";
+import { insertEmbedding } from "../src/store/embedding-pipeline.js";
+import { chunkDocumentByTokens } from "../src/store/chunking-async.js";
+import { reciprocalRankFusion } from "../src/store/query-engine.js";
+import { formatDocForEmbedding } from "../src/llm";
+import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm/singleton.js";
 
 // Eval queries with expected documents
 const evalQueries: {

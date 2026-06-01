@@ -10,15 +10,17 @@ import {
   _resetProductionModeForTesting,
   getPwd,
   getRealPath,
+} from "../src/store/path-utils.js";
+import { cleanupOrphanedVectors } from "../src/store/cleanup.js";
+import {
   isVirtualPath,
   parseVirtualPath,
   normalizeVirtualPath,
   normalizeDocid,
   isDocid,
   handelize,
-  cleanupOrphanedVectors,
   sanitizeFTS5Term,
-} from "../src/store";
+} from "../src/store/retrieval.js";
 
 // =============================================================================
 // Path Utilities
