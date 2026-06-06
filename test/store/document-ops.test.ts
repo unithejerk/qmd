@@ -6,7 +6,8 @@
 
 import { describe, test, expect, beforeAll, afterAll } from "vitest";
 import { createStore, syncConfigToDb } from "../../src/store.js";
-import { hashContent, extractTitle, insertContent, insertDocument } from "../../src/store/document-ops.js";
+import { hashContent, extractTitle, insertContent, insertDocument, findActiveDocument, findOrMigrateLegacyDocument } from "../../src/store/document-ops.js";
+import { handelize } from "../../src/store/retrieval-paths.js";
 import type { Database } from "../../src/db.js";
 import type { Store, CollectionConfig } from "../../src/store.js";
 import { unlink, mkdtemp, rmdir, writeFile, rename } from "node:fs/promises";
@@ -505,6 +506,31 @@ describe("Content-Addressable Storage", () => {
     // Both rows still exist (legacy row not migrated, not deactivated here)
     expect(store.findActiveDocument(collectionName, "readme.md")).not.toBeNull();
     expect(store.findActiveDocument(collectionName, "README.md")).not.toBeNull();
+
+    await cleanupTestDb(store);
+  });
+
+  test("findOrMigrateLegacyDocument migrates a handelized legacy path to the literal path", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    const now = new Date().toISOString();
+
+    const content = "# Budget\n\nQuarterly numbers.";
+    const hash = await hashContent(content);
+    const literalPath = "Budget & Revenue (Q4) [2024].md";
+    const legacyPath = handelize(literalPath);
+
+    insertContent(store.db, hash, content, now);
+    insertDocument(store.db, collectionName, legacyPath, "Budget", hash, now, now);
+
+    const result = findOrMigrateLegacyDocument(store.db, collectionName, literalPath);
+    expect(result).not.toBeNull();
+    expect(result!.hash).toBe(hash);
+
+    expect(findActiveDocument(store.db, collectionName, legacyPath)).toBeNull();
+    const migrated = findActiveDocument(store.db, collectionName, literalPath);
+    expect(migrated).not.toBeNull();
+    expect(migrated!.hash).toBe(hash);
 
     await cleanupTestDb(store);
   });

@@ -50,6 +50,81 @@ export function normalizePathSeparators(path: string): string {
 }
 
 /**
+ * Replace emoji and symbol Unicode codepoints with their hex representation.
+ *
+ * Used in {@link handelize} to produce ASCII-safe filenames from paths
+ * containing emoji characters. Each emoji run is replaced with its
+ * hyphen-joined hex code points (e.g. `🐘` -> `1f418`).
+ */
+export function emojiToHex(str: string): string {
+  return str.replace(/(?:\p{So}\p{Mn}?|\p{Sk})+/gu, (run) => {
+    return [...run].filter(c => /\p{So}|\p{Sk}/u.test(c))
+      .map(c => c.codePointAt(0)!.toString(16)).join('-');
+  });
+}
+
+/**
+ * Transform a filename into a token-friendly, URL-safe form.
+ *
+ * Applies a series of normalizations:
+ * - Converts `___` separators to `/` for path reconstruction
+ * - Replaces emoji/symbol codepoints with hex representations via {@link emojiToHex}
+ * - Replaces all non-alphanumeric characters (except `$`) with hyphens
+ * - Strips leading/trailing hyphens from each segment
+ * - Preserves file extensions on the last segment
+ *
+ * The result is safe for use in contexts where token boundaries matter
+ * (e.g. LLM tokenizers).
+ *
+ * @throws {Error} If `path` is empty or contains no valid filename content
+ */
+export function handelize(path: string): string {
+  if (!path || path.trim() === '') {
+    throw new Error('handelize: path cannot be empty');
+  }
+
+  const segments = path.split('/').filter(Boolean);
+  const lastSegment = segments[segments.length - 1] || '';
+  const filenameWithoutExt = lastSegment.replace(/\.[^.]+$/, '');
+  const hasValidContent = /[\p{L}\p{N}\p{So}\p{Sk}$]/u.test(filenameWithoutExt);
+  if (!hasValidContent) {
+    throw new Error(`handelize: path "${path}" has no valid filename content`);
+  }
+
+  const result = path
+    .replace(/___/g, '/')
+    .split('/')
+    .map((segment, idx, arr) => {
+      const isLastSegment = idx === arr.length - 1;
+      segment = emojiToHex(segment);
+
+      if (isLastSegment) {
+        const extMatch = segment.match(/(\.[a-z0-9]+)$/i);
+        const ext = extMatch ? extMatch[1] : '';
+        const nameWithoutExt = ext ? segment.slice(0, -ext.length) : segment;
+
+        const cleanedName = nameWithoutExt
+          .replace(/[^\p{L}\p{N}$]+/gu, '-')
+          .replace(/^-+|-+$/g, '');
+
+        return cleanedName + ext;
+      } else {
+        return segment
+          .replace(/[^\p{L}\p{N}$]+/gu, '-')
+          .replace(/^-+|-+$/g, '');
+      }
+    })
+    .filter(Boolean)
+    .join('/');
+
+  if (!result) {
+    throw new Error(`handelize: path "${path}" resulted in empty string after processing`);
+  }
+
+  return result;
+}
+
+/**
  * Detect if running inside WSL (Windows Subsystem for Linux).
  * On WSL, paths like /c/work/... are valid drvfs mount points, not Git Bash paths.
  */

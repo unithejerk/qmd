@@ -6,7 +6,7 @@
 
 import fastGlob from "fast-glob";
 import { readFileSync, statSync } from "node:fs";
-import { getRealPath, resolve } from "./path-utils.js";
+import { getRealPath, normalizePathSeparators, resolve } from "./path-utils.js";
 import { splitTopLevelCommaPatterns } from "../glob-patterns.js";
 import {
   deactivateDocument,
@@ -22,7 +22,6 @@ import {
   UNKNOWN_SOURCE_MTIME_MS,
 } from "./document-ops.js";
 import { cleanupOrphanedContent } from "./cleanup.js";
-import { handelize } from "./retrieval.js";
 import type { Store } from "../store.js";
 
 // =============================================================================
@@ -86,7 +85,7 @@ export async function reindexCollection(
 
   for (const relativeFile of files) {
     const filepath = getRealPath(resolve(collectionPath, relativeFile));
-    const path = handelize(relativeFile);
+    const path = normalizePathSeparators(relativeFile);
     seenPaths.add(path);
 
     let sourceMetadata: SourceMetadata;

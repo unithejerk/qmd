@@ -9,7 +9,7 @@
 import { describe, test, expect, beforeAll, afterAll, vi } from "vitest";
 import { openDatabase, loadSqliteVec } from "../src/db.js";
 import type { Database } from "../src/db.js";
-import { unlink, mkdtemp, rmdir, writeFile, rm } from "node:fs/promises";
+import { unlink, mkdtemp, rmdir, writeFile, rm, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
@@ -2592,5 +2592,43 @@ describe("isDocid", () => {
 
   test("rejects paths that look like hex with extensions", () => {
     expect(isDocid("abc123.md")).toBe(false);
+  });
+});
+
+describe("Path fidelity", () => {
+  test("reindexCollection stores literal paths for special-character filenames", async () => {
+    const store = await createTestStore();
+    const collectionDir = await mkdtemp(join(testDir, "literal-paths-"));
+    const collectionName = "literal-paths";
+
+    try {
+      const weirdName = "Budget & Revenue (Q4) [2024].md";
+      const weirdSubDir = join(collectionDir, "subdir");
+      const weirdSubName = "Notes #42 - foo@bar.md";
+      await mkdir(weirdSubDir, { recursive: true });
+      await writeFile(join(collectionDir, weirdName), "# Budget\n\nsearchterm-beta\n");
+      await writeFile(join(weirdSubDir, weirdSubName), "# Notes\n\nsearchterm-gamma\n");
+
+      await createTestCollection({ pwd: collectionDir, glob: "**/*.md", name: collectionName });
+      const result = await reindexCollection(store, collectionDir, "**/*.md", collectionName);
+      expect(result.indexed).toBe(2);
+
+      const rows = store.db.prepare(
+        "SELECT path FROM documents WHERE collection = ? AND active = 1 ORDER BY path"
+      ).all(collectionName) as Array<{ path: string }>;
+      const paths = rows.map((row) => row.path);
+
+      expect(paths).toContain(weirdName);
+      expect(paths).toContain(`subdir/${weirdSubName}`);
+      expect(paths).not.toContain("Budget-Revenue-Q4-2024.md");
+      expect(paths).not.toContain("subdir/Notes-42-foo-bar.md");
+
+      expect(store.toVirtualPath(join(collectionDir, weirdName))).toBe(
+        `qmd://${collectionName}/${weirdName}`
+      );
+    } finally {
+      await rm(collectionDir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
   });
 });

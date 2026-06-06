@@ -2,7 +2,7 @@
 
 An on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for your agentic flows.
 
-QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
+QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking, with local GGUF execution by default and optional per-role remote providers in this fork.
 
 ![QMD Architecture](assets/qmd-architecture.png)
 
@@ -342,7 +342,7 @@ const result = await store.update({
 // Generate vector embeddings
 const embedResult = await store.embed({
   force: false,           // true to re-embed everything
-  chunkStrategy: "auto",  // "regex" (default) or "auto" (AST for code files)
+  chunkStrategy: "auto",  // "auto" (default, AST-aware for code) or "regex"
   onProgress: ({ current, total, collection }) => {
     console.log(`Embedding ${current}/${total}`)
   },
@@ -499,7 +499,7 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
 ### System Requirements
 
 - **Node.js** >= 22
-- **Bun** >= 1.0.0
+- **Bun** >= 1.0.0 (optional alternative runtime)
 - **macOS**: Homebrew SQLite (for extension support)
   ```sh
   brew install sqlite
@@ -998,6 +998,21 @@ The adapter caches the last successful endpoint path, request shape, and input t
 #### Query vs Document Embeddings
 
 This fork forwards query intent through batch embedding paths (`isQuery: true`) in hybrid and structured search, so remote providers that support query/document embedding modes can improve retrieval quality.
+
+#### Remote Tokenizer Support
+
+When running against remote embedding providers, QMD can also use vLLM-style tokenizer endpoints for exact token-aware chunking during embedding:
+
+- Probes `/tokenize` with `/v1/tokenize` fallback
+- Uses `/detokenize` with `/v1/detokenize` fallback when it needs to trim chunks precisely
+- Defaults to automatic detection in remote mode
+- Falls back to character-based chunking with approximate token counts if tokenizer endpoints are unavailable
+
+Useful environment variables:
+
+- `QMD_REMOTE_TOKENIZER=auto|off|force` to control remote tokenizer use
+- `QMD_TOKENIZER_BASE_URL` / `QMD_TOKENIZER_MODEL` / `QMD_TOKENIZER_API_KEY` to override the tokenizer endpoint independently of the embed endpoint
+- `QMD_REMOTE_TOKENIZER_TIMEOUT_MS` to adjust tokenizer request timeout
 
 #### Graceful Degradation Behavior
 

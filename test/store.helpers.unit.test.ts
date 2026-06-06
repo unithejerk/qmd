@@ -10,6 +10,7 @@ import {
   _resetProductionModeForTesting,
   getPwd,
   getRealPath,
+  handelize,
 } from "../src/store/path-utils.js";
 import { cleanupOrphanedVectors } from "../src/store/cleanup.js";
 import {
@@ -18,7 +19,6 @@ import {
   normalizeVirtualPath,
   normalizeDocid,
   isDocid,
-  handelize,
   sanitizeFTS5Term,
 } from "../src/store/retrieval.js";
 

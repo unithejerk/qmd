@@ -19,7 +19,7 @@ import { execSync, spawn as nodeSpawn } from "child_process";
 import { fileURLToPath } from "url";
 import { basename, dirname, join as pathJoin, relative as relativePath, resolve as pathResolve } from "path";
 import { parseArgs } from "util";
-import { readFileSync, readdirSync, realpathSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync, lstatSync, rmSync, symlinkSync, readlinkSync, copyFileSync } from "fs";
+import { readFileSync, readdirSync, realpathSync, statSync, existsSync, unlinkSync, mkdirSync, lstatSync, rmSync, symlinkSync, readlinkSync, copyFileSync } from "fs";
 import { createInterface } from "readline/promises";
 import { splitTopLevelCommaPatterns } from "../glob-patterns.js";
 import {
@@ -33,8 +33,6 @@ import {
   getContextForFile,
   getContextForPath,
   listCollections,
-  removeCollection,
-  renameCollection,
   findSimilarFiles,
   findDocumentByDocid,
   isDocid,
@@ -80,8 +78,21 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { detectCollectionFromPath } from "./commands/context.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, isRemoteConfigured } from "../llm.js";
+import { finishSuccessfulCliCommand } from "./command-lifecycle.js";
+import { runMcpCommand } from "./commands/mcp.js";
+import {
+  contextAdd,
+  contextList,
+  contextRemove,
+  detectCollectionFromPath,
+} from "./commands/context.js";
+import {
+  collectionAdd,
+  collectionList,
+  collectionRemove,
+  collectionRename,
+} from "./commands/collections.js";
+import { getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, isRemoteConfigured } from "../llm.js";
 import { RemoteLLM, remoteConfigFromEnv } from "../embedding-provider.js";
 import {
   formatSearchResults,
@@ -151,11 +162,6 @@ import {
   getCollection as getCollectionFromYaml,
   listCollections as yamlListCollections,
   getDefaultCollectionNames,
-  addContext as yamlAddContext,
-  removeContext as yamlRemoveContext,
-  removeCollection as yamlRemoveCollectionFn,
-  renameCollection as yamlRenameCollectionFn,
-  setGlobalContext,
   listAllContexts,
   setConfigIndexName,
   loadConfig,
@@ -178,6 +184,7 @@ import {
 
 // Re-export search formatting utilities (moved to cli/search-formatting.ts)
 export { buildEditorUri, termLink } from "./search-formatting.js";
+export { finishSuccessfulCliCommand } from "./command-lifecycle.js";
 // Re-export store/DB lifecycle (moved to cli/lifecycle.ts)
 export {
   closeDb,
@@ -207,71 +214,6 @@ const cursor = {
   hide() { process.stderr.write('\x1b[?25l'); },
   show() { process.stderr.write('\x1b[?25h'); },
 };
-
-type CliLifecycleWritable = {
-  write(chunk: string | Uint8Array, callback?: (error?: Error | null) => void): boolean;
-};
-
-type FinishSuccessfulCliCommandOptions = {
-  command: string;
-  format?: OutputFormat;
-  cleanup?: () => Promise<void>;
-  exit?: (code: number) => void;
-  stdout?: CliLifecycleWritable;
-  stderr?: CliLifecycleWritable;
-};
-
-async function flushWritable(stream: CliLifecycleWritable): Promise<void> {
-  await new Promise<void>((resolve) => {
-    stream.write("", () => resolve());
-  });
-}
-
-/**
- * Finish a successful CLI command after output has been flushed.
- *
- * We deliberately do NOT call `process.exit(0)`. `process.exit()` skips
- * Node's `beforeExit` event, and node-llama-cpp registers a `beforeExit` hook
- * that auto-disposes its native handles. On darwin, without that hook firing,
- * libggml-metal's static `ggml_metal_device` destructor asserts on a
- * non-empty residency-set collection during `__cxa_finalize_ranges` and
- * dumps a multi-kB backtrace (upstream ggml-org/llama.cpp#22593, fix open as
- * PR #22595). Empirically, even with explicit `disposeDefaultLlamaCpp()` the
- * direct `process.exit(0)` path still trips the assertion — letting the
- * event loop drain naturally is what actually clears the rsets.
- *
- * So: set `process.exitCode = 0` and return. The main module finishes, the
- * event loop drains, `beforeExit` fires, native resources tear down in
- * order, and the process exits cleanly. The `GGML_METAL_NO_RESIDENCY=1` env
- * var that `bin/qmd` exports is a defense-in-depth safety net for paths
- * that still call `process.exit()` after loading the native binding
- * (signal handlers, error paths, `bun test`).
- *
- * If the caller passes an explicit `exit` for testability, we honor it —
- * the lifecycle tests verify the legacy flush → cleanup → exit ordering.
- * Production callers must not pass `exit`.
- */
-export async function finishSuccessfulCliCommand(options: FinishSuccessfulCliCommandOptions): Promise<void> {
-  const stderr = options.stderr ?? process.stderr;
-
-  await flushWritable(options.stdout ?? process.stdout);
-
-  try {
-    await (options.cleanup ?? disposeDefaultLlamaCpp)();
-  } catch (error) {
-    stderr.write(
-      `QMD Warning: cleanup after successful output failed (${error instanceof Error ? error.message : String(error)}); exiting 0 because command output completed.\n`
-    );
-  }
-  await flushWritable(stderr);
-
-  if (options.exit) {
-    options.exit(0);
-    return;
-  }
-
-  process.exitCode = 0;
-}
 
 // Ensure cursor is restored on exit
 process.on('SIGINT', () => { cursor.show(); process.exit(130); });
@@ -777,166 +719,6 @@ async function updateCollections(collectionNames?: string[]): Promise<void> {
   if (needsEmbedding > 0) {
     console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
   }
-}
-
-async function contextAdd(pathArg: string | undefined, contextText: string): Promise<void> {
-  const db = getDb();
-
-  // Handle "/" as global context (applies to all collections)
-  if (pathArg === '/') {
-    setGlobalContext(contextText);
-    resyncConfig();
-    console.log(`${c.green}✓${c.reset} Set global context`);
-    console.log(`${c.dim}Context: ${contextText}${c.reset}`);
-    closeDb();
-    return;
-  }
-
-  // Resolve path - defaults to current directory if not provided
-  let fsPath = pathArg || '.';
-  if (fsPath === '.' || fsPath === './') {
-    fsPath = getPwd();
-  } else if (fsPath.startsWith('~/')) {
-    fsPath = homedir() + fsPath.slice(1);
-  } else if (!fsPath.startsWith('/') && !fsPath.startsWith('qmd://')) {
-    fsPath = resolve(getPwd(), fsPath);
-  }
-
-  // Handle virtual paths (qmd://collection/path)
-  if (isVirtualPath(fsPath)) {
-    const parsed = parseVirtualPath(fsPath);
-    if (!parsed) {
-      console.error(`${c.yellow}Invalid virtual path: ${fsPath}${c.reset}`);
-      process.exit(1);
-    }
-
-    const coll = getCollectionFromYaml(parsed.collectionName);
-    if (!coll) {
-      console.error(`${c.yellow}Collection not found: ${parsed.collectionName}${c.reset}`);
-      process.exit(1);
-    }
-
-    yamlAddContext(parsed.collectionName, parsed.path, contextText);
-    resyncConfig();
-
-    const displayPath = parsed.path
-      ? `qmd://${parsed.collectionName}/${parsed.path}`
-      : `qmd://${parsed.collectionName}/ (collection root)`;
-    console.log(`${c.green}✓${c.reset} Added context for: ${displayPath}`);
-    console.log(`${c.dim}Context: ${contextText}${c.reset}`);
-    closeDb();
-    return;
-  }
-
-  // Detect collection from filesystem path
-  const detected = detectCollectionFromPath(db, fsPath);
-  if (!detected) {
-    console.error(`${c.yellow}Path is not in any indexed collection: ${fsPath}${c.reset}`);
-    console.error(`${c.dim}Run 'qmd status' to see indexed collections${c.reset}`);
-    process.exit(1);
-  }
-
-  yamlAddContext(detected.collectionName, detected.relativePath, contextText);
-  resyncConfig();
-
-  const displayPath = detected.relativePath ? `qmd://${detected.collectionName}/${detected.relativePath}` : `qmd://${detected.collectionName}/`;
-  console.log(`${c.green}✓${c.reset} Added context for: ${displayPath}`);
-  console.log(`${c.dim}Context: ${contextText}${c.reset}`);
-  closeDb();
-}
-
-function contextList(): void {
-  const db = getDb();
-
-  const allContexts = listAllContexts();
-
-  if (allContexts.length === 0) {
-    console.log(`${c.dim}No contexts configured. Use 'qmd context add' to add one.${c.reset}`);
-    closeDb();
-    return;
-  }
-
-  console.log(`\n${c.bold}Configured Contexts${c.reset}\n`);
-
-  let lastCollection = '';
-  for (const ctx of allContexts) {
-    if (ctx.collection !== lastCollection) {
-      console.log(`${c.cyan}${ctx.collection}${c.reset}`);
-      lastCollection = ctx.collection;
-    }
-
-    const displayPath = ctx.path ? `  ${ctx.path}` : '  / (root)';
-    console.log(`${displayPath}`);
-    console.log(`    ${c.dim}${ctx.context}${c.reset}`);
-  }
-
-  closeDb();
-}
-
-function contextRemove(pathArg: string): void {
-  if (pathArg === '/') {
-    // Remove global context
-    setGlobalContext(undefined);
-    // Resync so SQLite store_config is updated
-    const s = getStore();
-    resyncConfig();
-    closeDb();
-    console.log(`${c.green}✓${c.reset} Removed global context`);
-    return;
-  }
-
-  // Handle virtual paths
-  if (isVirtualPath(pathArg)) {
-    const parsed = parseVirtualPath(pathArg);
-    if (!parsed) {
-      console.error(`${c.yellow}Invalid virtual path: ${pathArg}${c.reset}`);
-      process.exit(1);
-    }
-
-    const coll = getCollectionFromYaml(parsed.collectionName);
-    if (!coll) {
-      console.error(`${c.yellow}Collection not found: ${parsed.collectionName}${c.reset}`);
-      process.exit(1);
-    }
-
-    const success = yamlRemoveContext(coll.name, parsed.path);
-
-    if (!success) {
-      console.error(`${c.yellow}No context found for: ${pathArg}${c.reset}`);
-      process.exit(1);
-    }
-
-    console.log(`${c.green}✓${c.reset} Removed context for: ${pathArg}`);
-    return;
-  }
-
-  // Handle filesystem paths
-  let fsPath = pathArg;
-  if (fsPath === '.' || fsPath === './') {
-    fsPath = getPwd();
-  } else if (fsPath.startsWith('~/')) {
-    fsPath = homedir() + fsPath.slice(1);
-  } else if (!fsPath.startsWith('/')) {
-    fsPath = resolve(getPwd(), fsPath);
-  }
-
-  const db = getDb();
-  const detected = detectCollectionFromPath(db, fsPath);
-  closeDb();
-
-  if (!detected) {
-    console.error(`${c.yellow}Path is not in any indexed collection: ${fsPath}${c.reset}`);
-    process.exit(1);
-  }
-
-  const success = yamlRemoveContext(detected.collectionName, detected.relativePath);
-
-  if (!success) {
-    console.error(`${c.yellow}No context found for: qmd://${detected.collectionName}/${detected.relativePath}${c.reset}`);
-    process.exit(1);
-  }
-
-  console.log(`${c.green}✓${c.reset} Removed context for: qmd://${detected.collectionName}/${detected.relativePath}`);
 }
 
 /**
@@ -1631,130 +1413,6 @@ function formatLsTime(date: Date): string {
     const minutes = date.getMinutes().toString().padStart(2, '0');
     return `${month} ${day} ${hours}:${minutes}`;
   }
-}
-
-// Collection management commands
-function collectionList(): void {
-  const db = getDb();
-  const collections = listCollections(db);
-
-  if (collections.length === 0) {
-    console.log("No collections found. Run 'qmd collection add .' to create one.");
-    closeDb();
-    return;
-  }
-
-  console.log(`${c.bold}Collections (${collections.length}):${c.reset}\n`);
-
-  for (const coll of collections) {
-    const updatedAt = coll.last_modified ? new Date(coll.last_modified) : new Date();
-    const timeAgo = formatTimeAgo(updatedAt);
-    
-    // Get YAML config to check includeByDefault
-    const yamlColl = getCollectionFromYaml(coll.name);
-    const excluded = yamlColl?.includeByDefault === false;
-    const excludeTag = excluded ? ` ${c.yellow}[excluded]${c.reset}` : '';
-
-    console.log(`${c.cyan}${coll.name}${c.reset} ${c.dim}(qmd://${coll.name}/)${c.reset}${excludeTag}`);
-    console.log(`  ${c.dim}Pattern:${c.reset}  ${coll.glob_pattern}`);
-    if (yamlColl?.ignore?.length) {
-      console.log(`  ${c.dim}Ignore:${c.reset}   ${yamlColl.ignore.join(', ')}`);
-    }
-    console.log(`  ${c.dim}Files:${c.reset}    ${coll.active_count}`);
-    console.log(`  ${c.dim}Updated:${c.reset}  ${timeAgo}`);
-    console.log();
-  }
-
-  closeDb();
-}
-
-async function collectionAdd(pwd: string, globPattern: string, name?: string): Promise<void> {
-  // If name not provided, generate from pwd basename
-  let collName = name;
-  if (!collName) {
-    const parts = pwd.split('/').filter(Boolean);
-    collName = parts[parts.length - 1] || 'root';
-  }
-
-  // Check if collection with this name already exists in YAML
-  const existing = getCollectionFromYaml(collName);
-  if (existing) {
-    console.error(`${c.yellow}Collection '${collName}' already exists.${c.reset}`);
-    console.error(`Use a different name with --name <name>`);
-    process.exit(1);
-  }
-
-  // Check if a collection with this pwd+glob already exists in YAML
-  const allCollections = yamlListCollections();
-  const existingPwdGlob = allCollections.find(c => c.path === pwd && c.pattern === globPattern);
-
-  if (existingPwdGlob) {
-    console.error(`${c.yellow}A collection already exists for this path and pattern:${c.reset}`);
-    console.error(`  Name: ${existingPwdGlob.name} (qmd://${existingPwdGlob.name}/)`);
-    console.error(`  Pattern: ${globPattern}`);
-    console.error(`\nUse 'qmd update' to re-index it, or remove it first with 'qmd collection remove ${existingPwdGlob.name}'`);
-    process.exit(1);
-  }
-
-  // Add to YAML config + sync to SQLite
-  const { addCollection } = await import("../collections.js");
-  addCollection(collName, pwd, globPattern);
-  resyncConfig();
-
-  // Create the collection and index files
-  console.log(`Creating collection '${collName}'...`);
-  const newColl = getCollectionFromYaml(collName);
-  await indexFiles(pwd, globPattern, collName, false, newColl?.ignore);
-  console.log(`${c.green}✓${c.reset} Collection '${collName}' created successfully`);
-}
-
-function collectionRemove(name: string): void {
-  // Check if collection exists in YAML
-  const coll = getCollectionFromYaml(name);
-  if (!coll) {
-    console.error(`${c.yellow}Collection not found: ${name}${c.reset}`);
-    console.error(`Run 'qmd collection list' to see available collections.`);
-    process.exit(1);
-  }
-
-  const db = getDb();
-  const result = removeCollection(db, name);
-  // Also remove from YAML config
-  yamlRemoveCollectionFn(name);
-  closeDb();
-
-  console.log(`${c.green}✓${c.reset} Removed collection '${name}'`);
-  console.log(`  Deleted ${result.deletedDocs} documents`);
-  if (result.cleanedHashes > 0) {
-    console.log(`  Cleaned up ${result.cleanedHashes} orphaned content hashes`);
-  }
-}
-
-function collectionRename(oldName: string, newName: string): void {
-  // Check if old collection exists in YAML
-  const coll = getCollectionFromYaml(oldName);
-  if (!coll) {
-    console.error(`${c.yellow}Collection not found: ${oldName}${c.reset}`);
-    console.error(`Run 'qmd collection list' to see available collections.`);
-    process.exit(1);
-  }
-
-  // Check if new name already exists in YAML
-  const existing = getCollectionFromYaml(newName);
-  if (existing) {
-    console.error(`${c.yellow}Collection name already exists: ${newName}${c.reset}`);
-    console.error(`Choose a different name or remove the existing collection first.`);
-    process.exit(1);
-  }
-
-  const db = getDb();
-  renameCollection(db, oldName, newName);
-  // Also rename in YAML config
-  yamlRenameCollectionFn(oldName, newName);
-  closeDb();
-
-  console.log(`${c.green}✓${c.reset} Renamed collection '${oldName}' to '${newName}'`);
-  console.log(`  Virtual paths updated: ${c.cyan}qmd://${oldName}/${c.reset} → ${c.cyan}qmd://${newName}/${c.reset}`);
 }
 
 async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false, ignorePatterns?: string[]): Promise<void> {
@@ -2498,7 +2156,7 @@ if (isMain) {
             }
           }
 
-          await collectionAdd(resolvedPwd, globPattern, name);
+          await collectionAdd(resolvedPwd, globPattern, name, indexFiles);
           break;
         }
 
@@ -2745,89 +2403,11 @@ if (isMain) {
     }
 
     case "mcp": {
-      const sub = cli.args[0]; // stop | status | undefined
-
-      // Cache dir for PID/log files — same dir as the index
-      const cacheDir = process.env.XDG_CACHE_HOME
-        ? resolve(process.env.XDG_CACHE_HOME, "qmd")
-        : resolve(homedir(), ".cache", "qmd");
-      const pidPath = resolve(cacheDir, "mcp.pid");
-
-      // Subcommands take priority over flags
-      if (sub === "stop") {
-        if (!existsSync(pidPath)) {
-          console.log("Not running (no PID file).");
-          process.exit(0);
-        }
-        const pid = parseInt(readFileSync(pidPath, "utf-8").trim());
-        try {
-          process.kill(pid, 0); // alive?
-          process.kill(pid, "SIGTERM");
-          unlinkSync(pidPath);
-          console.log(`Stopped QMD MCP server (PID ${pid}).`);
-        } catch {
-          unlinkSync(pidPath);
-          console.log("Cleaned up stale PID file (server was not running).");
-        }
-        process.exit(0);
-      }
-
-      if (cli.values.http) {
-        const port = Number(cli.values.port) || 8181;
-
-        if (cli.values.daemon) {
-          // Guard: check if already running
-          if (existsSync(pidPath)) {
-            const existingPid = parseInt(readFileSync(pidPath, "utf-8").trim());
-            try {
-              process.kill(existingPid, 0); // alive?
-              console.error(`Already running (PID ${existingPid}). Run 'qmd mcp stop' first.`);
-              process.exit(1);
-            } catch {
-              // Stale PID file — continue
-            }
-          }
-
-          mkdirSync(cacheDir, { recursive: true });
-          const logPath = resolve(cacheDir, "mcp.log");
-          const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
-          const selfPath = fileURLToPath(import.meta.url);
-          const indexArgs = cli.values.index ? ["--index", String(cli.values.index)] : [];
-          const spawnArgs = selfPath.endsWith(".ts")
-            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, ...indexArgs, "mcp", "--http", "--port", String(port)]
-            : [selfPath, ...indexArgs, "mcp", "--http", "--port", String(port)];
-          const child = nodeSpawn(process.execPath, spawnArgs, {
-            stdio: ["ignore", logFd, logFd],
-            detached: true,
-          });
-          child.unref();
-          closeSync(logFd); // parent's copy; child inherited the fd
-
-          writeFileSync(pidPath, String(child.pid));
-          console.log(`Started on http://localhost:${port}/mcp (PID ${child.pid})`);
-          console.log(`Logs: ${logPath}`);
-          process.exit(0);
-        }
-
-        // Foreground HTTP mode — remove top-level cursor handlers so the
-        // async cleanup handlers in startMcpHttpServer actually run.
-        process.removeAllListeners("SIGTERM");
-        process.removeAllListeners("SIGINT");
-        const { startMcpHttpServer } = await import("../mcp/server.js");
-        try {
-          await startMcpHttpServer(port, { dbPath: getDbPath() });
-        } catch (e: unknown) {
-          if (typeof e === "object" && e !== null && "code" in e && e.code === "EADDRINUSE") {
-            console.error(`Port ${port} already in use. Try a different port with --port.`);
-            process.exit(1);
-          }
-          throw e;
-        }
-      } else {
-        // Default: stdio transport
-        const { startMcpServer } = await import("../mcp/server.js");
-        await startMcpServer({ dbPath: getDbPath() });
-      }
+      await runMcpCommand({
+        args: cli.args,
+        values: cli.values,
+        selfPath: fileURLToPath(import.meta.url),
+      });
       break;
     }
 

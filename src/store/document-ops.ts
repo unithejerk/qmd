@@ -9,6 +9,7 @@
 import { createHash } from "crypto";
 import type { Database } from "../db.js";
 import { normalizeCjkForFTS } from "./db-init.js";
+import { handelize } from "./path-utils.js";
 
 export const UNKNOWN_SOURCE_MTIME_MS = -1;
 export const UNKNOWN_SOURCE_SIZE = -1;
@@ -183,12 +184,29 @@ export function findOrMigrateLegacyDocument(
   const existing = findActiveDocument(db, collectionName, path);
   if (existing) return existing;
 
-  const legacy = db.prepare(`
+  const legacyCase = db.prepare(`
     SELECT id, hash, title FROM documents
     WHERE collection = ? AND path COLLATE NOCASE = ? AND active = 1
     ORDER BY id
     LIMIT 1
   `).get(collectionName, path) as { id: number; hash: string; title: string } | undefined;
+  let legacyHandelized: { id: number; hash: string; title: string } | undefined;
+
+  try {
+    const handelizedPath = handelize(path);
+    if (handelizedPath !== path) {
+      legacyHandelized = db.prepare(`
+        SELECT id, hash, title FROM documents
+        WHERE collection = ? AND path = ? AND active = 1
+        ORDER BY id
+        LIMIT 1
+      `).get(collectionName, handelizedPath) as { id: number; hash: string; title: string } | undefined;
+    }
+  } catch {
+    // handelize() can reject invalid path shapes; skip slug migration in that case.
+  }
+
+  const legacy = legacyCase ?? legacyHandelized;
   if (!legacy) return null;
 
   // Wrap rename + FTS rebuild in a transaction for atomicity.
