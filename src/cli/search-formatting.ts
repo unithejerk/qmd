@@ -1,3 +1,21 @@
+/**
+ * QMD CLI Search Formatting - Output rendering and query utilities for the
+ * qmd CLI tool.
+ *
+ * Provides:
+ * - FTS5 query construction (`buildFTS5Query`) with phrase/NEAR/OR strategy.
+ * - Result formatting across 6 output modes: CLI (default), JSON, CSV, MD,
+ *   XML, and files (compact path list).
+ * - Structured query parsing (`parseStructuredQuery`) for the lex:/vec:/hyde:
+ *   multi-line query document format.
+ * - Collection filter resolution (`resolveCollectionFilter`, `filterByCollections`).
+ * - Terminal-link generation (`buildEditorUri`, `termLink`) for clickable
+ *   file paths in TTY output.
+ *
+ * Re-exported through src/cli/qmd.ts for use by tests and other consumers.
+ *
+ * @module
+ */
 import { existsSync } from "fs";
 import {
   homedir,
@@ -91,7 +109,22 @@ const DEFAULT_EDITOR_URI_TEMPLATE = "vscode://file/{path}:{line}:{col}";
 // FTS5 query utilities
 // =============================================================================
 
-// Build FTS5 query: phrase-aware with fallback to individual terms
+/**
+ * Build an FTS5 query string from a plain-text search query.
+ *
+ * Converts the user's raw query into a multi-strategy FTS5 expression that
+ * tries exact phrase match first, then NEAR proximity, then individual terms
+ * as OR clauses. Version number dots (e.g. "2026.4.10") are normalized to
+ * spaces so FTS5 can match them as adjacent tokens.
+ *
+ * Unlike the store-level `buildFTS5Query`, this CLI version operates on the
+ * raw query passed on the command line rather than sub-queries produced by
+ * the expansion pipeline.
+ *
+ * @param query - Raw user query string.
+ * @returns FTS5 expression string suitable for MATCH, or "" if no viable
+ *   terms remain after sanitization.
+ */
 export function buildFTS5Query(query: string): string {
   // Replace dots in version patterns (e.g., "2026.4.10") with spaces so FTS5
   // can match them as an exact phrase of adjacent tokens.
@@ -234,6 +267,24 @@ export function getEditorUriTemplate(): string {
   return DEFAULT_EDITOR_URI_TEMPLATE;
 }
 
+/**
+ * Build an editor URI from a template string, substituting {path}, {line},
+ * and {col} (or {column}) placeholders.
+ *
+ * The template comes from `getEditorUriTemplate()`, which checks the
+ * `QMD_EDITOR_URI` env var, then the YAML config (`editor_uri`), then the
+ * default `vscode://file/{path}:{line}:{col}`.
+ *
+ * The path is percent-encoded for safety (extra encoding for ? and #).
+ * Line and column values are floored to positive integers, defaulting to 1
+ * if NaN or non-positive.
+ *
+ * @param template - URI template with {path}, {line}, {col} placeholders.
+ * @param absolutePath - Absolute filesystem path to the target file.
+ * @param line - 1-indexed line number (clamped to >= 1).
+ * @param col - 1-indexed column number (clamped to >= 1).
+ * @returns A formatted editor URI string (e.g. "vscode://file/...:42:1").
+ */
 export function buildEditorUri(template: string, absolutePath: string, line: number, col: number): string {
   const safeLine = Number.isFinite(line) && line > 0 ? Math.floor(line) : 1;
   const safeCol = Number.isFinite(col) && col > 0 ? Math.floor(col) : 1;
@@ -255,6 +306,33 @@ export function termLink(text: string, url: string, isTTY: boolean = !!process.s
 // Result formatting
 // =============================================================================
 
+/**
+ * Format and print search results to stdout in the requested output format.
+ *
+ * Supports six output modes selected via `opts.format`:
+ * - `cli` (default) — colorized terminal output with score, snippet, context,
+ *   clickable editor URIs (when TTY), and optional explain traces.
+ * - `json` — structured JSON for LLM/programmatic consumption.
+ * - `csv` — comma-separated values with headers.
+ * - `md` — markdown section-per-result.
+ * - `xml` — XML document with `<file>` elements.
+ * - `files` — compact one-line-per-result (score, path, docid).
+ *
+ * Results are filtered by `opts.minScore` and capped at `opts.limit` before
+ * rendering. Empty results after filtering print a format-appropriate empty
+ * response (e.g., `[]` for JSON, `<results></results>` for XML).
+ *
+ * With `--full-path`, qmd:// URIs are replaced with real filesystem paths
+ * (relative to $PWD when the file is under the working directory). Docids
+ * are omitted in this mode since the filesystem path serves as the identifier.
+ *
+ * @param results - Search result rows to render.
+ * @param query - The original query string (used for snippet extraction and
+ *   term highlighting in CLI mode).
+ * @param opts - Output options controlling format, limits, scores, line
+ *   numbers, explain traces, and full-path display.
+ * Side effects: writes to stdout via console.log.
+ */
 export function outputResults(results: OutputRow[], query: string, opts: OutputOptions): void {
   const filtered = results.filter(r => r.score >= opts.minScore).slice(0, opts.limit);
 
@@ -472,8 +550,21 @@ export function outputResults(results: OutputRow[], query: string, opts: OutputO
 // Collection filtering
 // =============================================================================
 
-// Resolve -c collection filter: supports single string, array, or undefined.
-// Returns validated collection names (exits on unknown collection).
+/**
+ * Resolve the `-c`/`--collection` filter argument to validated collection names.
+ *
+ * Accepts a single string, an array of strings, or undefined. When `raw` is
+ * undefined and `useDefaults` is true, returns all collections that are
+ * included by default. Validates each collection name against the YAML config
+ * — exits the process with an error message for unknown collection names.
+ *
+ * @param raw - Collection name, array of names, or undefined.
+ * @param useDefaults - When true and `raw` is undefined, return default-included
+ *   collections instead of an empty array.
+ * @returns Array of validated collection name strings.
+ * Side effects: writes to stderr and calls `process.exit(1)` if a collection
+ * name is not found in the YAML config.
+ */
 export function resolveCollectionFilter(raw: string | string[] | undefined, useDefaults: boolean = false): string[] {
   // If no filter specified and useDefaults is true, use default collections
   if (!raw && useDefaults) {

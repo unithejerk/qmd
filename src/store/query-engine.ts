@@ -1,13 +1,27 @@
 /**
  * Query engine — hybrid, vector, and structured search orchestration.
  *
- * This module provides:
- *  - Query expansion via LLM (expandQuery)
- *  - LLM reranking (rerank)
- *  - Reciprocal Rank Fusion (reciprocalRankFusion, buildRrfTrace)
- *  - Hybrid search pipeline (hybridQuery)
- *  - Vector-only search (vectorSearchQuery)
- *  - Structured pre-expanded search (structuredSearch)
+ * This module orchestrates multi-stage retrieval pipelines that combine BM25
+ * full-text search, vector similarity search, LLM-based query expansion,
+ * reciprocal rank fusion (RRF), and chunk-level cross-encoder reranking with
+ * position-aware blending.
+ *
+ * Major exports:
+ * - {@link hybridQuery}: Full pipeline (BM25 probe -> expand -> route -> RRF -> chunk -> rerank -> blend)
+ * - {@link vectorSearchQuery}: Vector-only search with batch embedding
+ * - {@link structuredSearch}: Pre-expanded query search for LLM callers
+ * - {@link expandQuery}: LLM query expansion with deduplication and caching
+ * - {@link rerank}: Chunk-level cross-encoder reranking with result caching
+ * - {@link reciprocalRankFusion}: RRF algorithm with k=60 and top-rank bonuses
+ * - {@link buildRrfTrace}: Detailed per-file RRF contribution tracing for explainability
+ * - {@link getHybridRrfWeights}: Weight assignment (2.0 for original query, 1.0 for expansions)
+ * - {@link StoreQueryApi}: Interface defining the store API surface required by the engine
+ *
+ * The hybrid pipeline uses adaptive candidate limits based on score distribution
+ * (low/high ambiguity detection) and blends RRF position scores with reranker
+ * scores using position-dependent weights.
+ *
+ * @module query-engine
  */
 
 import type { Database } from "../db.js";
@@ -136,6 +150,26 @@ function filterExpandedQueries(raw: ExpandedQuery[], originalQuery: string): Exp
   return filtered;
 }
 
+/**
+ * Expand a query using the LLM to generate alternative phrasings for lexical
+ * (BM25), vector (embedding), and HyDE (hypothetical-document) search.
+ *
+ * The expansion is cached in the database keyed by query + model + intent.
+ * Results are filtered through {@link filterExpandedQueries} which enforces:
+ * - Minimum Jaccard novelty (0.12) vs the original query
+ * - Near-duplicate detection (Jaccard >= 0.88)
+ * - Per-type limits (lex: 2, vec: 3, hyde: 2)
+ *
+ * @param query - The original user query to expand
+ * @param model - The generation model identifier (defaults to `DEFAULT_GENERATE_MODEL_URI`)
+ * @param db - Database handle for caching
+ * @param intent - Optional intent context to bias query expansion
+ * @param llmOverride - Optional LLM instance (falls back to the global singleton)
+ * @returns Array of {@link ExpandedQuery} objects, each with a `type` and `query` string
+ *
+ * **Side effects:** May write to the LLM query cache (`cache` table) on first expansion.
+ * Calls the LLM's `expandQuery` method.
+ */
 export async function expandQuery(query: string, model: string = DEFAULT_GENERATE_MODEL_URI, db: Database, intent?: string, llmOverride?: LLM): Promise<ExpandedQuery[]> {
   const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
@@ -173,6 +207,28 @@ export async function expandQuery(query: string, model: string = DEFAULT_GENERAT
 // Reranking
 // =============================================================================
 
+/**
+ * Rerank document chunks using a cross-encoder reranker model.
+ *
+ * Each document chunk is scored independently against the (optional intent + query)
+ * string. Results are cached per unique chunk text to avoid redundant reranking
+ * across calls. Unscored chunks are batched and sent to the LLM reranker, while
+ * previously cached scores are reused.
+ *
+ * If an `intent` is provided, it is prepended to the query to guide the reranker.
+ *
+ * @param query - The original user query
+ * @param documents - Array of `{ file, text }` objects where `file` is a document
+ *   identifier and `text` is the chunk text to score
+ * @param model - Reranker model identifier (defaults to `DEFAULT_RERANK_MODEL_URI`)
+ * @param db - Database handle for score caching
+ * @param intent - Optional intent string (prepended to query)
+ * @param llmOverride - Optional LLM instance (falls back to the global singleton)
+ * @returns Array of `{ file, score }` sorted by score descending
+ *
+ * **Side effects:** Writes per-chunk scores to the `cache` table. Calls the LLM
+ * reranker endpoint for uncached chunks.
+ */
 export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL_URI, db: Database, intent?: string, llmOverride?: LLM): Promise<{ file: string; score: number }[]> {
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
 
@@ -213,6 +269,23 @@ export async function rerank(query: string, documents: { file: string; text: str
 // Reciprocal Rank Fusion
 // =============================================================================
 
+/**
+ * Combine multiple ranked result lists using Reciprocal Rank Fusion (RRF).
+ *
+ * Each document's RRF score is the sum of `weight / (k + rank)` across all
+ * lists. A top-rank bonus is applied:
+ * - Rank 1: +0.05 bonus
+ * - Rank 2-3: +0.02 bonus
+ *
+ * The default `k = 60` is the standard RRF constant that controls how quickly
+ * high ranks dominate the fused score. Results are returned sorted by total
+ * RRF score descending.
+ *
+ * @param resultLists - Array of ranked result lists (each is `RankedResult[]`)
+ * @param weights - Per-list weight multipliers (defaults to 1.0 for each list)
+ * @param k - RRF constant (default 60). Higher values reduce the impact of top ranks.
+ * @returns A single merged list of `RankedResult` with RRF scores, sorted by score
+ */
 export function reciprocalRankFusion(
   resultLists: RankedResult[][],
   weights: number[] = [],
@@ -263,6 +336,23 @@ export type RankedListMeta = {
   query: string;
 };
 
+/**
+ * Build detailed RRF contribution traces for explainable search results.
+ *
+ * For each document appearing in any result list, records every individual
+ * RRF contribution (list index, source, query type, rank, weight, backend
+ * score, and the `weight / (k + rank)` contribution) along with aggregate
+ * metrics (base score, top rank, top-rank bonus, and total score).
+ *
+ * This is used by the `explain` mode in {@link hybridQuery} and
+ * {@link structuredSearch} to populate the {@link HybridQueryExplain} structure.
+ *
+ * @param resultLists - Array of ranked result lists
+ * @param weights - Per-list weight multipliers
+ * @param listMeta - Per-list metadata (source, queryType, query text)
+ * @param k - RRF constant (default 60)
+ * @returns A Map from filepath to {@link RRFScoreTrace} with full contribution details
+ */
 export function buildRrfTrace(
   resultLists: RankedResult[][],
   weights: number[] = [],
@@ -399,6 +489,16 @@ export interface StructuredSearchOptions {
 // Helper functions
 // =============================================================================
 
+/**
+ * Assign RRF weights to each ranked result list in the hybrid pipeline.
+ *
+ * The original query (type `"original"`) gets weight 2.0 so it dominates
+ * the fused ranking. All expanded queries (types `"lex"`, `"vec"`, `"hyde"`)
+ * get weight 1.0.
+ *
+ * @param rankedListMeta - Metadata for each result list
+ * @returns Array of weights parallel to `rankedListMeta`
+ */
 export function getHybridRrfWeights(rankedListMeta: RankedListMeta[]): number[] {
   return rankedListMeta.map(meta => meta.queryType === "original" ? 2.0 : 1.0);
 }
@@ -481,7 +581,20 @@ function selectChunkIndicesForRerank(
 // Hybrid Query
 // =============================================================================
 
-/** Store API surface needed by the query engine (subset of Store methods with pre-bound db) */
+/**
+ * Store API surface required by the query engine.
+ *
+ * This is a subset of the full {@link Store} type (from `src/store.ts`) with
+ * pre-bound database handle. The query engine only depends on these methods,
+ * making it testable with a mock store.
+ *
+ * Required capabilities:
+ * - `searchFTS` / `searchVec`: Low-level search primitives
+ * - `expandQuery` / `rerank`: LLM-based query expansion and reranking
+ * - `db`: Raw database handle for hydration and context resolution
+ * - `embedModelName` / `generateModelName` / `rerankModelName`: Model selection
+ *   (can also be set via `llm` property)
+ */
 export interface StoreQueryApi {
   db: Database;
   llm?: LLM;
@@ -499,7 +612,38 @@ function resolveStoreEmbedModel(store: StoreQueryApi): string {
 }
 
 /**
- * Hybrid search: BM25 + vector + query expansion + RRF + chunked reranking.
+ * Hybrid search combining BM25, vector similarity, query expansion, RRF,
+ * chunk-level reranking, and position-aware score blending.
+ *
+ * The full pipeline:
+ * 1. **BM25 probe** — Quick FTS5 search to check for a "strong signal"
+ *    (top score >= 0.85 and gap >= 0.15). If present, expansion is skipped.
+ * 2. **Query expansion** — LLM generates alternative phrasings (lex, vec, hyde)
+ *    if no strong signal.
+ * 3. **Route searches** — Execute FTS for `lex` queries and vector search for
+ *    `vec`/`hyde` queries. Vector embeddings are computed in a single batch.
+ * 4. **RRF fusion** — Merge result lists via {@link reciprocalRankFusion}
+ *    with weighted contributions (original query at 2x).
+ * 5. **Adaptive candidate limit** — Adjusts the reranker pool based on score
+ *    distribution (low vs high ambiguity).
+ * 6. **Chunk documents** — Split candidates into chunks via {@link chunkDocumentAsync}.
+ * 7. **Rerank (optional)** — Score chunks with cross-encoder via {@link rerank},
+ *    keeping the best chunk per document.
+ * 8. **Blend scores** — Combine RRF position score with reranker score using
+ *    position-dependent weights (0.75 for ranks 1-3, 0.60 for 4-10, 0.40 for rest).
+ * 9. **Deduplicate, filter, slice** — Remove duplicates, apply minScore, limit.
+ *
+ * @param store - A {@link StoreQueryApi} instance with pre-bound database
+ * @param query - The raw user query string
+ * @param options - {@link HybridQueryOptions} for collection filter, limit, scoring,
+ *   explainability, intent, reranking toggle, chunk strategy, and lifecycle hooks
+ * @returns Array of {@link HybridQueryResult} sorted by blended score descending
+ *
+ * **Side effects:**
+ * - Calls the LLM for query expansion and (optionally) reranking
+ * - Calls the LLM embedding endpoint for batch vector computation
+ * - Reads from `sqlite_master`, FTS index, and document tables
+ * - Writes to the LLM cache via `expandQuery` and `rerank`
  */
 export async function hybridQuery(
   store: StoreQueryApi,
@@ -794,6 +938,25 @@ export async function hybridQuery(
 // Vector Search Query
 // =============================================================================
 
+/**
+ * Vector-only search with batch embedding and optional query expansion.
+ *
+ * Unlike {@link hybridQuery}, this performs no BM25 search and no reranking.
+ * The pipeline:
+ * 1. Query expansion (optional) via {@link expandQuery}, filtered to `vec`/`hyde` types
+ * 2. Batch embedding of all query texts (original + expanded)
+ * 3. Vector search for each embedded query via {@link searchVec}
+ * 4. Merge results keeping the best score per filepath
+ *
+ * @param store - A {@link StoreQueryApi} instance
+ * @param query - The raw user query
+ * @param options - {@link VectorSearchOptions} for collection, limit, minScore, intent, hooks
+ * @returns Array of {@link VectorSearchResult} sorted by score descending
+ *
+ * **Side effects:**
+ * - Calls the LLM for query expansion and batch embedding
+ * - Reads from the `vectors_vec` virtual table and document tables
+ */
 export async function vectorSearchQuery(
   store: StoreQueryApi,
   query: string,
@@ -875,6 +1038,31 @@ export async function vectorSearchQuery(
 // Structured Search
 // =============================================================================
 
+/**
+ * Execute a search with pre-expanded queries from an LLM caller (e.g. auto
+ * query rewriting or structured retrieval-augmented generation).
+ *
+ * Unlike {@link hybridQuery}, this function skips query expansion and accepts
+ * an already-expanded list of {@link ExpandedQuery} entries. The caller is
+ * responsible for validation (query type and structure). The pipeline:
+ * 1. Validate each query (single-line, balanced quotes for lex, no negation for vec/hyde)
+ * 2. Execute FTS for `lex` searches and vector search for `vec`/`hyde` searches
+ * 3. RRF fusion of all result lists
+ * 4. Chunking, optional reranking, and position-aware blending (identical to
+ *    the hybrid pipeline's steps 5-8)
+ *
+ * @param store - A {@link StoreQueryApi} instance
+ * @param searches - Array of pre-expanded {@link ExpandedQuery} entries (must have at least one)
+ * @param options - {@link StructuredSearchOptions} for multi-collection, limit, reranking, etc.
+ * @returns Array of {@link HybridQueryResult} sorted by blended score descending
+ *
+ * @throws {Error} If any query contains newlines, unbalanced quotes (lex), or
+ *   negation syntax (vec/hyde)
+ *
+ * **Side effects:**
+ * - Calls the LLM for batch embedding and (optionally) reranking
+ * - Reads from FTS index, `vectors_vec`, and document tables
+ */
 export async function structuredSearch(
   store: StoreQueryApi,
   searches: ExpandedQuery[],

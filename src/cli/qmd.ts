@@ -1,3 +1,18 @@
+/**
+ * QMD CLI - Main entry point for the `qmd` command-line tool.
+ *
+ * Parses CLI arguments (via `parseCLI`), dispatches to the appropriate handler
+ * (search, query, vector search, get, multi-get, context management, collection
+ * management, skills, MCP server, etc.), and manages the application lifecycle
+ * through `finishSuccessfulCliCommand()`.
+ *
+ * Database and LLM resources are opened lazily per-command and cleaned up after
+ * output via `process.exitCode = 0` rather than an immediate `process.exit(0)`,
+ * so that node-llama-cpp's `beforeExit` hook can tear down native binding
+ * handles cleanly (see `finishSuccessfulCliCommand()` for details).
+ *
+ * @module
+ */
 import { isBun, openDatabase } from "../db.js";
 import type { Database, SQLiteValue } from "../db.js";
 import { execSync, spawn as nodeSpawn } from "child_process";
@@ -279,6 +294,20 @@ const progress = {
   },
 };
 
+/**
+ * Initialize a project-local QMD index in the current working directory.
+ *
+ * Creates a `.qmd/` directory containing `index.yml` and `index.sqlite`,
+ * sets the config source and store DB path to the local files, syncs the
+ * initial schema, and writes a default (empty) YAML config.
+ *
+ * Rejects with an error when run from $HOME to prevent accidentally
+ * overriding the user-level global index.
+ *
+ * @throws {Error} If the CWD is the home directory.
+ * Side effects: creates `.qmd/` directory and files, sets global config
+ * source and store DB path override, closes any previously-open DB.
+ */
 function initLocalIndex(): void {
   const cwd = getPwd();
   if (sameDirectory(cwd, homedir())) {
@@ -2252,7 +2281,19 @@ async function showVersion(): Promise<void> {
   console.log(`qmd ${versionStr}`);
 }
 
-// Main CLI - only run if this is the main module
+// =============================================================================
+// Main CLI dispatch
+// =============================================================================
+// Only runs when this module is the entry point (not when imported for exports).
+// The `isMain` guard allows tests and other consumers to import utilities like
+// buildEditorUri, termLink, etc. without triggering production-mode setup.
+//
+// The switch below handles every qmd subcommand. Each case opens the DB,
+// runs the handler, and returns control to the end of the block so that
+// finishSuccessfulCliCommand() can run cleanup (DB close, LLM disposal).
+// The "mcp" command is exempt because the server loop owns the process.
+// =============================================================================
+
 const __filename = fileURLToPath(import.meta.url);
 const argv1 = process.argv[1];
 const isMain = argv1 === __filename

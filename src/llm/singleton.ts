@@ -209,6 +209,8 @@ export function getDefaultLlamaCpp(): LlamaCpp {
  * Accepts any LLM implementation — LlamaCpp (local), RemoteLLM (remote),
  * or null to clear. Used by CLI getStore() to inject a RemoteLLM, and
  * by LocalEmbeddingProvider to register itself as the default.
+ * When setting a non-null instance, also installs the Darwin exit guard
+ * (see installDarwinExitGuard — currently a no-op for back-compat).
  *
  * @param llm - The LLM instance to set as default, or null to clear
  */
@@ -218,18 +220,26 @@ export function setDefaultLlamaCpp(llm: LLM | null): void {
 }
 
 /**
- * Peek at the default LLM instance without instantiating one. Used by
- * doctor and lifecycle diagnostics.
+ * Check whether the default LLM instance has been set (without
+ * instantiating one).
+ *
+ * Unlike getDefaultLlamaCpp(), this does NOT trigger lazy initialization
+ * or check for remote configuration. Used by doctor and lifecycle
+ * diagnostics to inspect state without side effects.
+ *
+ * @returns true if a default instance has been explicitly set
  */
 export function hasDefaultLlamaCpp(): boolean {
   return defaultLlamaCpp !== null;
 }
 
 /**
- * Dispose the default LLM instance if it exists.
+ * Dispose the default LLM instance if it exists and clear the reference.
  *
  * Call this before process exit to prevent NAPI crashes from native
- * llama.cpp backends. For RemoteLLM, dispose() is a no-op.
+ * llama.cpp backends. For RemoteLLM or NoopLlamaCpp instances, dispose()
+ * is a no-op. After disposal, subsequent calls to getDefaultLlamaCpp()
+ * will create a fresh instance.
  *
  * @returns Promise that resolves when disposal is complete
  */

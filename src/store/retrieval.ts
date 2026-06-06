@@ -1,14 +1,28 @@
 /**
  * Retrieval primitives — document lookup, search, and status.
  *
- * This module provides:
- *  - Document types and virtual-path handling
- *  - Low-level FTS and vector search
- *  - Document retrieval (findDocument, getDocumentBody, findDocuments)
- *  - Fuzzy matching and docid lookup
- *  - Snippet extraction
- *  - Context resolution
- *  - Collection management
+ * This module provides the low-level database operations for all search and
+ * document retrieval in QMD. It operates on raw SQLite database handles and
+ * returns plain data structures (no ILLMSession dependency — LLM-based features
+ * live in {@link ../query-engine.ts}).
+ *
+ * Major exports:
+ * - **Search:** {@link searchFTS} (BM25 full-text), {@link searchVec} (cosine-similarity vector)
+ * - **Document lookup:** {@link findDocument}, {@link getDocumentBody}, {@link findDocuments},
+ *   {@link findDocumentByDocid}, {@link findSimilarFiles}, {@link matchFilesByGlob}
+ * - **Virtual paths:** {@link parseVirtualPath}, {@link buildVirtualPath}, {@link isVirtualPath},
+ *   {@link resolveVirtualPath}, {@link toVirtualPath}
+ * - **Docid helpers:** {@link getDocid}, {@link normalizeDocid}, {@link isDocid}
+ * - **Filters:** {@link sanitizeFTS5Term}, {@link validateSemanticQuery}, {@link validateLexQuery}
+ * - **Context:** {@link getContextForFile}, {@link getContextForPath}, {@link createContextResolver}
+ * - **Collections:** {@link getCollectionByName}, {@link listCollections}, {@link removeCollection},
+ *   {@link renameCollection}, {@link getAllCollections}
+ * - **Snippets:** {@link extractSnippet}, {@link extractIntentTerms}
+ * - **Status:** {@link getStatus}
+ * - **Utilities:** {@link handelize}, {@link emojiToHex}, {@link addLineNumbers},
+ *   {@link loadSearchDocumentsByFilepaths}
+ *
+ * @module retrieval
  */
 
 import picomatch from "picomatch";
@@ -172,13 +186,28 @@ export type IndexStatus = {
 // =============================================================================
 
 /**
- * Extract short docid from a full hash (first 6 characters).
+ * Extract a short docid from a full content hash.
+ *
+ * The docid is the first 6 hexadecimal characters of the hash, used for
+ * human-friendly document references (e.g. `#abc123`).
+ *
+ * @param hash - Full content hash (typically a SHA-256 hex string)
+ * @returns First 6 characters of the hash
  */
 export function getDocid(hash: string): string {
   return hash.slice(0, 6);
 }
 
-/** Replace emoji/symbol codepoints with their hex representation (e.g. 🐘 → 1f418) */
+/**
+ * Replace emoji and symbol Unicode codepoints with their hex representation.
+ *
+ * Used in {@link handelize} to produce ASCII-safe filenames from paths
+ * containing emoji characters. Each emoji run is replaced with its
+ * hyphen-joined hex code points (e.g. `🐘` -> `1f418`).
+ *
+ * @param str - Input string that may contain emoji/symbol characters
+ * @returns String with emoji codepoints replaced by hex representations
+ */
 export function emojiToHex(str: string): string {
   return str.replace(/(?:\p{So}\p{Mn}?|\p{Sk})+/gu, (run) => {
     return [...run].filter(c => /\p{So}|\p{Sk}/u.test(c))
@@ -187,7 +216,22 @@ export function emojiToHex(str: string): string {
 }
 
 /**
- * Handelize a filename to be more token-friendly.
+ * Transform a filename into a token-friendly, URL-safe form.
+ *
+ * Applies a series of normalizations:
+ * - Converts `___` separators to `/` for path reconstruction
+ * - Replaces emoji/symbol codepoints with hex representations via {@link emojiToHex}
+ * - Replaces all non-alphanumeric characters (except `$`) with hyphens
+ * - Strips leading/trailing hyphens from each segment
+ * - Preserves file extensions on the last segment
+ *
+ * The result is safe for use in contexts where token boundaries matter
+ * (e.g. LLM tokenizers).
+ *
+ * @param path - Filesystem path to transform
+ * @returns Token-friendly path string
+ *
+ * @throws {Error} If `path` is empty or contains no valid filename content
  */
 export function handelize(path: string): string {
   if (!path || path.trim() === '') {
@@ -235,6 +279,15 @@ export function handelize(path: string): string {
   return result;
 }
 
+/**
+ * Normalize a docid string by stripping surrounding quotes and leading `#`.
+ *
+ * Accepts any of the common user-input formats: `#abc123`, `abc123`,
+ * `"#abc123"`, `'abc123'`, etc.
+ *
+ * @param docid - Raw docid string from user input
+ * @returns Normalized hex-only string (without `#` or quotes)
+ */
 export function normalizeDocid(docid: string): string {
   let normalized = docid.trim();
 
@@ -273,14 +326,23 @@ export type VirtualPath = {
   indexName?: string;
 };
 
+/**
+ * Normalize a virtual path to a consistent `qmd://collection/path` format.
+ *
+ * Handles various input styles:
+ * - `qmd:////collection/path` (extra slashes) -> `qmd://collection/path`
+ * - `//collection/path` (missing `qmd:` prefix) -> `qmd://collection/path`
+ * - Bare filesystem paths and docids are returned as-is
+ *
+ * @param input - A virtual path, filesystem path, or docid string
+ * @returns The normalized canonical form
+ */
 export function normalizeVirtualPath(input: string): string {
   let path = input.trim();
 
   // Handle qmd:// with extra slashes: qmd:////collection/path -> qmd://collection/path
   if (path.startsWith('qmd:')) {
-    // Remove qmd: prefix and normalize slashes
     path = path.slice(4);
-    // Remove leading slashes and re-add exactly two
     path = path.replace(/^\/+/, '');
     return `qmd://${path}`;
   }
@@ -291,13 +353,20 @@ export function normalizeVirtualPath(input: string): string {
     return `qmd://${path}`;
   }
 
-  // Return as-is for other cases (filesystem paths, docids, bare collection/path, etc.)
   return path;
 }
 
 /**
- * Parse a virtual path like "qmd://collection-name/path/to/file.md"
- * into its components.
+ * Parse a virtual path URI into its structured components.
+ *
+ * Accepts formats:
+ * - `qmd://collection-name/path/to/file.md`
+ * - `qmd://collection-name?index=someIndex` (with optional query-string index name)
+ * - `qmd://collection-name/` (collection root)
+ *
+ * @param virtualPath - A `qmd://` URI string (will be normalized first)
+ * @returns A {@link VirtualPath} object with `collectionName`, `path`, and optional `indexName`,
+ *   or `null` if the path does not match the virtual path pattern
  */
 export function parseVirtualPath(virtualPath: string): VirtualPath | null {
   // Normalize the path first
@@ -317,7 +386,15 @@ export function parseVirtualPath(virtualPath: string): VirtualPath | null {
 }
 
 /**
- * Build a virtual path from collection name and relative path.
+ * Build a virtual path URI from collection name, relative path, and optional index.
+ *
+ * The resulting URI is in the form `qmd://collectionName/path` with an
+ * optional `?index=...` query parameter for multi-index collections.
+ *
+ * @param collectionName - Name of the collection (encoded as the URI authority)
+ * @param path - Relative path within the collection
+ * @param indexName - Optional index name (appended as a query parameter)
+ * @returns A virtual path URI string
  */
 export function buildVirtualPath(collectionName: string, path: string, indexName?: string): string {
   const base = `qmd://${collectionName}/${path}`;
@@ -325,10 +402,16 @@ export function buildVirtualPath(collectionName: string, path: string, indexName
 }
 
 /**
- * Check if a path is explicitly a virtual path.
- * Only recognizes explicit virtual path formats:
- * - qmd://collection/path.md
- * - //collection/path.md
+ * Check whether a string is a virtual path URI.
+ *
+ * Recognizes:
+ * - `qmd://collection/path.md` (preferred format)
+ * - `//collection/path.md` (short form, missing `qmd:` prefix)
+ *
+ * Bare filesystem paths and docid strings return `false`.
+ *
+ * @param path - The string to test
+ * @returns `true` if the string starts with `qmd:` or `//`
  */
 export function isVirtualPath(path: string): boolean {
   const trimmed = path.trim();
@@ -342,6 +425,16 @@ export function isVirtualPath(path: string): boolean {
   return false;
 }
 
+/**
+ * Resolve a virtual path to an absolute filesystem path.
+ *
+ * Parses the virtual path to extract the collection name and relative path,
+ * then looks up the collection's base directory and joins them.
+ *
+ * @param db - Database handle (used to look up the collection's base path)
+ * @param virtualPath - A `qmd://collection/path` URI
+ * @returns Absolute filesystem path, or `null` if the collection is not found
+ */
 export function resolveVirtualPath(db: Database, virtualPath: string): string | null {
   const parsed = parseVirtualPath(virtualPath);
   if (!parsed) return null;
@@ -352,6 +445,17 @@ export function resolveVirtualPath(db: Database, virtualPath: string): string | 
   return resolvePath(coll.pwd, parsed.path);
 }
 
+/**
+ * Convert an absolute filesystem path to its virtual path URI.
+ *
+ * Iterates all registered collections and checks whether the path falls
+ * within any collection's base directory. If the corresponding document
+ * is found in the database, returns its `qmd://` URI.
+ *
+ * @param db - Database handle (used to look up collections and verify the document)
+ * @param absolutePath - Absolute filesystem path to convert
+ * @returns Virtual path URI, or `null` if the path doesn't belong to any collection
+ */
 export function toVirtualPath(db: Database, absolutePath: string): string | null {
   // Get all collections from DB
   const collections = getStoreCollections(db);
@@ -385,6 +489,17 @@ export function toVirtualPath(db: Database, absolutePath: string): string | null
 // Fuzzy matching and docid lookup
 // =============================================================================
 
+/**
+ * Look up a document by its short docid (6+ hex characters of the content hash).
+ *
+ * Accepts any format supported by {@link normalizeDocid} (with or without `#`,
+ * surrounding quotes) and searches for documents whose hash starts with the
+ * given prefix.
+ *
+ * @param db - Database handle
+ * @param docid - Docid string (e.g. `#abc123`, `abc123`, `"abc123"`)
+ * @returns Object with `filepath` (virtual path) and `hash`, or `null` if not found
+ */
 export function findDocumentByDocid(db: Database, docid: string): { filepath: string; hash: string } | null {
   const shortHash = normalizeDocid(docid);
 
@@ -401,6 +516,18 @@ export function findDocumentByDocid(db: Database, docid: string): { filepath: st
   return doc;
 }
 
+/**
+ * Find active document paths that are within a Levenshtein distance of the query.
+ *
+ * Used by {@link findDocument} to provide "did you mean?" suggestions when a
+ * path lookup fails. Compares the lowercase query against lowercase document paths.
+ *
+ * @param db - Database handle
+ * @param query - The path or name to fuzzy-match against
+ * @param maxDistance - Maximum Levenshtein distance (default 3)
+ * @param limit - Maximum number of results (default 5)
+ * @returns Array of matching document paths
+ */
 export function findSimilarFiles(db: Database, query: string, maxDistance: number = 3, limit: number = 5): string[] {
   const allFiles = db.prepare(`
     SELECT d.path
@@ -436,6 +563,18 @@ function levenshtein(a: string, b: string): number {
   return dp[m]![n]!;
 }
 
+/**
+ * Match active document paths against a glob pattern.
+ *
+ * Uses picomatch for glob matching. The pattern is tested against:
+ * - The virtual path (`qmd://collection/path`)
+ * - The raw document path
+ * - The `collection/path` composite
+ *
+ * @param db - Database handle
+ * @param pattern - Glob pattern (e.g. `**\/*.md`, `docs/*`)
+ * @returns Array of matching file metadata with virtual path, display path, and body length
+ */
 export function matchFilesByGlob(db: Database, pattern: string): { filepath: string; displayPath: string; bodyLength: number }[] {
   const allFiles = db.prepare(`
     SELECT
@@ -462,6 +601,16 @@ export function matchFilesByGlob(db: Database, pattern: string): { filepath: str
 // FTS Search
 // =============================================================================
 
+/**
+ * Sanitize a single term for use in an FTS5 MATCH query.
+ *
+ * Removes all characters except letters, digits, apostrophes, and underscores,
+ * then lowercases the result. This prevents FTS5 syntax errors from special
+ * characters while preserving meaningful word boundaries.
+ *
+ * @param term - Raw search term to sanitize
+ * @returns Lowercase alphanumeric string safe for FTS5 queries
+ */
 export function sanitizeFTS5Term(term: string): string {
   return term.replace(/[^\p{L}\p{N}'_]/gu, '').toLowerCase();
 }
@@ -550,6 +699,15 @@ function buildFTS5Query(query: string): string | null {
   return result;
 }
 
+/**
+ * Validate a query string intended for semantic (vector/query-expansion) search.
+ *
+ * Semantic search does not support negation syntax (`-term`). Returns an error
+ * message if negation is detected, or `null` if the query is valid.
+ *
+ * @param query - The raw query string to validate
+ * @returns An error message string, or `null` if the query is valid
+ */
 export function validateSemanticQuery(query: string): string | null {
   if (/(^|\s)-[\w"]/.test(query)) {
     return 'Negation (-term) is not supported in vec/hyde queries. Use lex for exclusions.';
@@ -557,6 +715,16 @@ export function validateSemanticQuery(query: string): string | null {
   return null;
 }
 
+/**
+ * Validate a query string intended for lexical (FTS/BM25) search.
+ *
+ * Checks for:
+ * - Newline characters (lex queries must be single-line)
+ * - Unmatched double quotes (unbalanced `"`)
+ *
+ * @param query - The raw query string to validate
+ * @returns An error message string, or `null` if the query is valid
+ */
 export function validateLexQuery(query: string): string | null {
   if (/[\r\n]/.test(query)) {
     return 'Lex queries must be a single line. Remove newline characters or split into separate lex: lines.';
@@ -575,6 +743,29 @@ function resolveSearchResultOptions(options?: SearchResultOptions): Required<Sea
   };
 }
 
+/**
+ * Execute a BM25 full-text search via FTS5.
+ *
+ * Builds an FTS5 query string from the raw input (handling phrases, negation,
+ * CJK characters, and hyphenated tokens), then queries the `documents_fts`
+ * virtual table ordered by BM25 score. Scores are normalized to [0, 1] via
+ * the absolute-value sigmoid `|score| / (1 + |score|)`.
+ *
+ * If `collectionName` is provided, a wider candidate set (`limit * 10`) is
+ * fetched from FTS before filtering to the collection and re-limiting, so
+ * that within-collection ranking is fair.
+ *
+ * @param db - Database handle
+ * @param query - Raw user query string (supports phrase `"..."`, negation `-`,
+ *   CJK character sequences, hyphenated tokens)
+ * @param limit - Maximum number of results (default 20)
+ * @param collectionName - Optional: restrict results to a single collection
+ * @param options - Controls whether body and/or context are included in results
+ * @returns Array of {@link SearchResult} sorted by BM25 score (best first)
+ *
+ * **Side effects:** Reads the `documents_fts`, `documents`, and `content` tables.
+ * When `includeContext` is true, also reads from `store_collections` via `createContextResolver`.
+ */
 export function searchFTS(
   db: Database,
   query: string,
@@ -667,6 +858,41 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
   return result?.embedding || null;
 }
 
+/**
+ * Execute a vector similarity search using sqlite-vec.
+ *
+ * This is a two-step query that avoids JOINs on the vector search side:
+ * 1. Query `vectors_vec` with `k = limit * 3` for the nearest neighbor
+ *    hash_seq values using cosine distance
+ * 2. Map the hash_seq results to document metadata via a separate SQL query
+ *    with `WHERE hash_seq IN (...)` placeholders
+ *
+ * Results are deduplicated by filepath (keeping the lowest distance per file),
+ * converted from cosine distance to a [0, 1] similarity score via `1 - distance`,
+ * and sorted by score descending.
+ *
+ * If `precomputedEmbedding` is provided, the embedding step is skipped (used
+ * by the query engine for batch embedding reuse).
+ *
+ * @param db - Database handle
+ * @param query - Raw query text (embedded into a vector using the LLM)
+ * @param model - Embedding model identifier (e.g. `embeddinggemma`)
+ * @param limit - Maximum number of results (default 20)
+ * @param collectionName - Optional: restrict results to a single collection
+ * @param session - An active LLM session for embedding (if omitted, a new session is created from the global LLM)
+ * @param precomputedEmbedding - Optional pre-computed embedding vector to skip LLM embedding step
+ * @param llm - Optional LLM instance override (used if `session` is not provided)
+ * @param options - Controls whether body and/or context are included
+ * @returns Array of {@link SearchResult} sorted by cosine similarity (best first)
+ *
+ * **Side effects:**
+ * - Reads the `vectors_vec` virtual table (sqlite-vec index)
+ * - May call the LLM embedding endpoint if no `precomputedEmbedding` is given
+ * - Reads from `content_vectors`, `documents`, and `content` tables
+ * - When `includeContext` is true, reads from `store_collections`
+ *
+ * @throws May propagate LLM embedding errors if the embedding call fails
+ */
 export async function searchVec(
   db: Database,
   query: string,
@@ -778,7 +1004,21 @@ type DbDocRow = {
 };
 
 /**
- * Find a document by filename/path, docid (#hash), or with fuzzy matching.
+ * Find a single document by filename, virtual path, or docid.
+ *
+ * Lookup strategy (in order):
+ * 1. If the input is a docid (6+ hex chars), resolve it via {@link findDocumentByDocid}
+ * 2. Exact match against the virtual path `qmd://collection/path`
+ * 3. LIKE search with a leading `%` wildcard on the virtual path
+ * 4. Direct match against `collection/path` in each collection (for bare paths)
+ * 5. If all searches fail, return a {@link DocumentNotFound} with similar-file suggestions
+ *
+ * @param db - Database handle
+ * @param filename - Path, virtual path, or docid to look up
+ * @param options - Set `includeBody: true` to include the document body in the result
+ * @returns A {@link DocumentResult} on success, or a {@link DocumentNotFound} on failure
+ *
+ * **Side effects:** Reads `documents`, `content`, and `store_collections` tables.
  */
 export function findDocument(db: Database, filename: string, options: { includeBody?: boolean } = {}): DocumentResult | DocumentNotFound {
   let filepath = filename;
@@ -876,7 +1116,19 @@ export function findDocument(db: Database, filename: string, options: { includeB
 }
 
 /**
- * Get the body content for a document
+ * Get the body content for a document, with optional line-range slicing.
+ *
+ * Supports both virtual paths (`qmd://collection/path`) and filesystem paths.
+ * If `fromLine` and/or `maxLines` are provided, the body is sliced to the
+ * specified line range (1-indexed).
+ *
+ * @param db - Database handle
+ * @param doc - A document result (containing `filepath`) or an object with a `filepath` string
+ * @param fromLine - Optional start line (1-indexed, default: beginning)
+ * @param maxLines - Optional maximum number of lines to return
+ * @returns The document body string, or `null` if the document is not found
+ *
+ * **Side effects:** Reads `documents`, `content`, and `store_collections` tables.
  */
 export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: string }, fromLine?: number, maxLines?: number): string | null {
   const filepath = doc.filepath;
@@ -922,7 +1174,23 @@ export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: 
 }
 
 /**
- * Find multiple documents by glob pattern or comma-separated list
+ * Find multiple documents by glob pattern or comma-separated list.
+ *
+ * Determines the input mode automatically:
+ * - If the pattern contains commas (and no glob wildcards), it is treated as a
+ *   comma-separated list of explicit paths or docids
+ * - Otherwise, it is treated as a glob pattern and matched against all active
+ *   documents via {@link matchFilesByGlob}
+ *
+ * Results that exceed `maxBytes` in body size return a `skipped: true` entry
+ * with a reason string instead of the body.
+ *
+ * @param db - Database handle
+ * @param pattern - Glob pattern or comma-separated list of paths/docids
+ * @param options - Controls body inclusion and max byte threshold
+ * @returns Object with `docs` array ({@link MultiGetResult}) and `errors` array
+ *
+ * **Side effects:** Reads `documents`, `content`, and `store_collections` tables.
  */
 export function findDocuments(
   db: Database,
@@ -1125,6 +1393,16 @@ export function createContextResolver(db: Database): (filepath: string) => strin
 // Collection management
 // =============================================================================
 
+/**
+ * Look up a collection's metadata by name.
+ *
+ * @param db - Database handle
+ * @param name - Collection name to look up
+ * @returns Collection metadata with `name`, `pwd` (base path), and `glob_pattern`,
+ *   or `null` if not found
+ *
+ * **Side effects:** Reads from `store_collections` table.
+ */
 export function getCollectionByName(db: Database, name: string): { name: string; pwd: string; glob_pattern: string } | null {
   const collection = getStoreCollection(db, name);
   if (!collection) return null;
@@ -1136,6 +1414,19 @@ export function getCollectionByName(db: Database, name: string): { name: string;
   };
 }
 
+/**
+ * List all registered collections with document stats.
+ *
+ * For each collection, counts the total and active document count and finds
+ * the most recent `modified_at` timestamp. Results are ordered by the
+ * collection's internal order (as returned by the config store).
+ *
+ * @param db - Database handle
+ * @returns Array of collection info including name, path, glob pattern, document counts,
+ *   last modified timestamp, and `includeByDefault` flag
+ *
+ * **Side effects:** Reads `store_collections` and `documents` tables.
+ */
 export function listCollections(db: Database): { name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null; includeByDefault: boolean }[] {
   const collections = getStoreCollections(db);
 
@@ -1163,6 +1454,22 @@ export function listCollections(db: Database): { name: string; pwd: string; glob
   return result;
 }
 
+/**
+ * Remove a collection and its documents from the database.
+ *
+ * Deletes all document entries for the collection, then cleans up orphaned
+ * content hashes that are no longer referenced by any active document.
+ * Also removes the collection's configuration entry.
+ *
+ * @param db - Database handle
+ * @param collectionName - Name of the collection to remove
+ * @returns Object with `deletedDocs` (number of deleted document rows) and
+ *   `cleanedHashes` (number of orphaned content hashes removed)
+ *
+ * **Side effects:**
+ * - Writes to `documents` (DELETE), `content` (DELETE), and `store_collections` (DELETE)
+ * - The deleted documents' embeddings remain in `content_vectors` until orphan cleanup
+ */
 export function removeCollection(db: Database, collectionName: string): { deletedDocs: number; cleanedHashes: number } {
   const docResult = db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
 
@@ -1179,6 +1486,18 @@ export function removeCollection(db: Database, collectionName: string): { delete
   };
 }
 
+/**
+ * Rename a collection, updating both document records and the configuration store.
+ *
+ * @param db - Database handle
+ * @param oldName - Current collection name
+ * @param newName - New collection name
+ * @returns void
+ *
+ * **Side effects:**
+ * - Updates `documents.collection` for all documents in the collection
+ * - Updates the collection name in `store_collections`
+ */
 export function renameCollection(db: Database, oldName: string, newName: string): void {
   db.prepare(`UPDATE documents SET collection = ? WHERE collection = ?`)
     .run(newName, oldName);
@@ -1186,11 +1505,29 @@ export function renameCollection(db: Database, oldName: string, newName: string)
   renameStoreCollection(db, oldName, newName);
 }
 
+/**
+ * Get a list of all collection names.
+ *
+ * @param db - Database handle
+ * @returns Array of objects with `name` property for each collection
+ */
 export function getAllCollections(db: Database): { name: string }[] {
   const collections = getStoreCollections(db);
   return collections.map(c => ({ name: c.name }));
 }
 
+/**
+ * Find collections that have no context configured (empty or missing contexts).
+ *
+ * A collection is considered "without context" if its context object is null,
+ * undefined, or has no keys. Results are sorted alphabetically by collection name.
+ *
+ * @param db - Database handle
+ * @returns Array of collections missing context, each with `name`, `pwd` (base path),
+ *   and `doc_count` (active document count)
+ *
+ * **Side effects:** Reads `store_collections` and `documents` tables.
+ */
 export function getCollectionsWithoutContext(db: Database): { name: string; pwd: string; doc_count: number }[] {
   const allCollections = getStoreCollections(db);
   const collectionsWithoutContext: { name: string; pwd: string; doc_count: number }[] = [];
@@ -1214,6 +1551,19 @@ export function getCollectionsWithoutContext(db: Database): { name: string; pwd:
   return collectionsWithoutContext.sort((a, b) => a.name.localeCompare(b.name));
 }
 
+/**
+ * Find top-level directory paths within a collection that have no context configured.
+ *
+ * Scans all active document paths and extracts the first path segment (top-level
+ * directory), then checks each one against the collection's configured context
+ * prefixes. Paths that don't match any prefix are returned.
+ *
+ * @param db - Database handle
+ * @param collectionName - Name of the collection to scan
+ * @returns Sorted array of top-level directory names that lack context
+ *
+ * **Side effects:** Reads `documents` and `store_collections` tables.
+ */
 export function getTopLevelPathsWithoutContext(db: Database, collectionName: string): string[] {
   const paths = db.prepare(`
     SELECT DISTINCT path FROM documents
@@ -1260,6 +1610,21 @@ export function getTopLevelPathsWithoutContext(db: Database, collectionName: str
 // Context CRUD
 // =============================================================================
 
+/**
+ * Insert or update context for a collection path prefix.
+ *
+ * Resolves collection ID to name, then delegates to the config-sync layer.
+ *
+ * @param db - Database handle
+ * @param collectionId - Numeric ID of the collection
+ * @param pathPrefix - Path prefix within the collection (empty string for root)
+ * @param context - The context text to associate
+ * @returns void
+ *
+ * @throws {Error} If the collection with the given ID is not found
+ *
+ * **Side effects:** Writes to the `store_collections` context metadata.
+ */
 export function insertContext(db: Database, collectionId: number, pathPrefix: string, context: string): void {
   const coll = db.prepare(`SELECT name FROM collections WHERE id = ?`).get(collectionId) as { name: string } | null;
   if (!coll) {
@@ -1269,11 +1634,32 @@ export function insertContext(db: Database, collectionId: number, pathPrefix: st
   updateStoreContext(db, coll.name, pathPrefix, context);
 }
 
+/**
+ * Remove a context entry for a specific collection and path prefix.
+ *
+ * @param db - Database handle
+ * @param collectionName - Name of the collection
+ * @param pathPrefix - Path prefix whose context to remove
+ * @returns 1 if the context was removed, 0 if no matching context existed
+ *
+ * **Side effects:** Writes to the `store_collections` context metadata.
+ */
 export function deleteContext(db: Database, collectionName: string, pathPrefix: string): number {
   const success = removeStoreContext(db, collectionName, pathPrefix);
   return success ? 1 : 0;
 }
 
+/**
+ * Remove all global and collection-root contexts.
+ *
+ * Clears the global context entry and iterates all collections to remove
+ * the root context prefix (`''`) from each.
+ *
+ * @param db - Database handle
+ * @returns Number of contexts removed
+ *
+ * **Side effects:** Writes to both the global context and per-collection context metadata.
+ */
 export function deleteGlobalContexts(db: Database): number {
   let deletedCount = 0;
 
@@ -1289,6 +1675,17 @@ export function deleteGlobalContexts(db: Database): number {
   return deletedCount;
 }
 
+/**
+ * List all configured contexts across all collections.
+ *
+ * Results are sorted first by collection name, then by path prefix length
+ * (longest first for specificity), then alphabetically by prefix.
+ *
+ * @param db - Database handle
+ * @returns Array of context entries with `collection_name`, `path_prefix`, and `context`
+ *
+ * **Side effects:** Reads from `store_collections` context metadata.
+ */
 export function listPathContexts(db: Database): { collection_name: string; path_prefix: string; context: string }[] {
   const allContexts = getStoreContexts(db);
 
@@ -1311,6 +1708,25 @@ export function listPathContexts(db: Database): { collection_name: string; path_
 // Status
 // =============================================================================
 
+/**
+ * Get the current index status including document counts, embedding needs,
+ * vector index availability, and per-collection summaries.
+ *
+ * The result includes:
+ * - `totalDocuments`: count of active documents across all collections
+ * - `needsEmbedding`: count of documents whose content is not yet embedded
+ *   for the given model (from {@link getHashesNeedingEmbedding})
+ * - `hasVectorIndex`: whether the `vectors_vec` virtual table exists (i.e.,
+ *   at least one embedding has been added)
+ * - `collections`: per-collection stats with document counts and last update time
+ *
+ * @param db - Database handle
+ * @param model - Embedding model to check (defaults to `DEFAULT_EMBED_MODEL_URI`)
+ * @returns An {@link IndexStatus} object with aggregate and per-collection metrics
+ *
+ * **Side effects:** Reads `documents`, `store_collections`, `content_vectors`, and
+ * `sqlite_master` tables.
+ */
 export function getStatus(db: Database, model: string = DEFAULT_EMBED_MODEL_URI): IndexStatus {
   // DB is source of truth for collections — config provides supplementary metadata
   const dbCollections = db.prepare(`
@@ -1388,12 +1804,48 @@ const INTENT_STOP_WORDS = new Set([
   "about", "looking", "notes", "search", "where", "which",
 ]);
 
+/**
+ * Extract meaningful terms from an intent string for weighted snippet boosting.
+ *
+ * Lowercases the string, splits on whitespace, strips leading/trailing
+ * non-alphanumeric characters, and filters out single-character terms and
+ * common stop words (defined in `INTENT_STOP_WORDS`).
+ *
+ * Used by {@link extractSnippet} to boost lines that match intent terms
+ * (at weight {@link INTENT_WEIGHT_SNIPPET}) in addition to query terms.
+ *
+ * @param intent - The intent string (typically from query expansion)
+ * @returns Array of filtered, meaningful intent terms
+ */
 export function extractIntentTerms(intent: string): string[] {
   return intent.toLowerCase().split(/\s+/)
     .map(t => t.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""))
     .filter(t => t.length > 1 && !INTENT_STOP_WORDS.has(t));
 }
 
+/**
+ * Extract a relevant snippet from a document body based on query and intent terms.
+ *
+ * The algorithm:
+ * 1. If `chunkPos` is given (from vector search), narrow the search window to
+ *    the vicinity of the matching chunk (`chunkPos - 100` to `chunkPos + searchLen + 100`)
+ * 2. Score each line by counting query term matches (weight 1.0) and intent term
+ *    matches (weight {@link INTENT_WEIGHT_SNIPPET} = 0.3)
+ * 3. Select the highest-scoring line as the snippet anchor
+ * 4. Return a context window of 1 line before and 3 lines after the anchor
+ * 5. Format result as a unified-diff-style header with absolute line numbers
+ *
+ * If no matching line is found in the chunk window, falls back to searching
+ * the full body.
+ *
+ * @param body - Full document body text
+ * @param query - Raw search query (split into whitespace-separated terms)
+ * @param maxLen - Maximum snippet text length in characters (default 500)
+ * @param chunkPos - Optional character position of the matching chunk (from vector search)
+ * @param chunkLen - Optional length of the matching chunk (defaults to `CHUNK_SIZE_CHARS`)
+ * @param intent - Optional intent string to extract additional boosting terms
+ * @returns A {@link SnippetResult} with line number, formatted snippet text, and context counts
+ */
 export function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: number, chunkLen?: number, intent?: string): SnippetResult {
   const totalLines = body.split('\n').length;
   let searchBody = body;
@@ -1472,7 +1924,13 @@ export function extractSnippet(body: string, query: string, maxLen = 500, chunkP
 // =============================================================================
 
 /**
- * Add line numbers to text content.
+ * Prepend line numbers to each line of text.
+ *
+ * Format: `N: <line content>` where N starts at `startLine` and increments.
+ *
+ * @param text - The text to number
+ * @param startLine - The number for the first line (default 1)
+ * @returns Numbered text string
  */
 export function addLineNumbers(text: string, startLine: number = 1): string {
   const lines = text.split('\n');
@@ -1482,7 +1940,19 @@ export function addLineNumbers(text: string, startLine: number = 1): string {
 export type HydratedSearchDocument = DocumentResult & { body: string };
 
 /**
- * Hydrate search results with full document bodies.
+ * Hydrate search result filepaths with full document bodies and metadata.
+ *
+ * Takes a list of filepath strings (virtual or filesystem) and loads their
+ * complete document data from the database in a single batch. Supports
+ * both virtual path lookups (`qmd://collection/path`) and direct virtual
+ * path matching for efficiency.
+ *
+ * @param db - Database handle
+ * @param filepaths - Array of filepath strings to hydrate
+ * @param resolveContext - A context resolver function (typically from {@link createContextResolver})
+ * @returns A Map from filepath to fully hydrated {@link HydratedSearchDocument}
+ *
+ * **Side effects:** Reads `documents` and `content` tables.
  */
 export function loadSearchDocumentsByFilepaths(
   db: Database,

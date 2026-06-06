@@ -1,14 +1,27 @@
 /**
  * QMD Store - Core data access and retrieval functions
  *
- * This module provides all database operations, search functions, and document
- * retrieval for QMD. It returns raw data structures that can be formatted by
- * CLI or MCP consumers.
+ * This module is the top-level store factory for QMD. It provides:
+ * - {@link createStore} to instantiate a {@link Store} bound to a SQLite database
+ * - Re-exports of all search, retrieval, embedding, caching, and cleanup functions
+ *   from the `src/store/` submodules
+ * - The {@link generateEmbeddings} wrapper that bridges the Store-based API to the
+ *   decomposed embedding pipeline
+ * - The {@link maybeAdoptLegacyEmbeddingFingerprint} migration for pre-fingerprint
+ *   vector embeddings
  *
  * Usage:
  *   const store = createStore("/path/to/db.sqlite");
  *   // or use default path:
  *   const store = createStore();
+ *
+ * The returned {@link Store} object exposes methods for indexing, search (FTS, vector,
+ * hybrid), query expansion, reranking, document retrieval, context management, virtual
+ * paths, and database maintenance. All methods delegate to the decomposed submodules
+ * (`src/store/retrieval.ts`, `src/store/query-engine.ts`, `src/store/embedding-pipeline.ts`,
+ * etc.) and are already bound to the database connection.
+ *
+ * @module store
  */
 
 import { openDatabase } from "./db.js";
@@ -221,13 +234,32 @@ export { verifySqliteVecLoaded };
 export { getEmbeddingFingerprint };
 
 /**
- * Get the active LLM instance for a store — prefers the store instance and
- * falls back to the global singleton.
+ * Resolve the active LLM instance for a store.
+ *
+ * Prefers the LLM attached to the store instance (set at creation time or
+ * configured externally) and falls back to the global singleton LLM if the
+ * store carries none. The global singleton is created on first access and
+ * cached for the process lifetime.
+ *
+ * @param store - The store whose optional `llm` property to prefer
+ * @returns An {@link LLM} instance ready for embedding, generation, or reranking
  */
 function getLlm(store: Store): LLM {
   return getStoreLlm(store.llm);
 }
 
+/**
+ * Check whether the sqlite-vec extension is loaded and available.
+ *
+ * This is a read-only query into the module-level availability flag that is
+ * set during database initialization. It does not perform any I/O.
+ *
+ * @returns `true` if sqlite-vec was successfully loaded, `false` otherwise
+ *
+ * @throws Never — this is a synchronous, no-I/O check
+ *
+ * **Side effects:** None
+ */
 export function isSqliteVecAvailable(): boolean {
   return isSqliteVecAvailableState();
 }
@@ -237,10 +269,36 @@ export function isSqliteVecAvailable(): boolean {
 // Store Factory
 // =============================================================================
 
+/**
+ * A store instance bound to a single SQLite database.
+ *
+ * Created via {@link createStore}. All methods are already wired to the
+ * underlying database connection and are ready for immediate use.
+ *
+ * Method groups:
+ * - **Search:** FTS (`searchFTS`), vector (`searchVec`)
+ * - **Query expansion & reranking:** `expandQuery`, `rerank`
+ * - **Document retrieval:** `findDocument`, `getDocumentBody`, `findDocuments`
+ * - **Fuzzy/docid:** `findSimilarFiles`, `matchFilesByGlob`, `findDocumentByDocid`
+ * - **Indexing:** `insertContent`, `insertDocument`, `updateDocument`, ...
+ * - **Vector/embedding:** `getHashesForEmbedding`, `clearAllEmbeddings`, `insertEmbedding`
+ * - **Context:** `getContextForFile`, `getContextForPath`, `getCollectionByName`, ...
+ * - **Virtual paths:** `parseVirtualPath`, `buildVirtualPath`, `resolveVirtualPath`, ...
+ * - **Index health:** `getStatus`, `getIndexHealth`, `getHashesNeedingEmbedding`
+ * - **Caching:** `getCacheKey`, `getCachedResult`, `setCachedResult`, `clearCache`
+ * - **Maintenance:** `deleteLLMCache`, `deleteInactiveDocuments`, `cleanupOrphanedContent`,
+ *   `cleanupOrphanedVectors`, `vacuumDatabase`
+ */
 export type Store = {
+  /** The raw SQLite database handle. Prefer the typed methods on this object. */
   db: Database;
+  /** Absolute path to the SQLite database file this store is bound to */
   dbPath: string;
-  /** Optional LLM instance for this store (overrides the global singleton) */
+  /**
+   * Optional LLM instance that overrides the global singleton for this store.
+   * When set, embedding, generation, and reranking use this instance instead of
+   * the auto-detected default.
+   */
   llm?: LLM;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;
@@ -318,8 +376,20 @@ export { type ReindexProgress, type ReindexResult, reindexCollection } from "./s
 export { type EmbedFailure, type EmbedProgress, type EmbedResult, type EmbedOptions };
 
 /**
- * Generate vector embeddings for documents that need them.
- * Thin wrapper that bridges the Store-based API to the decomposed embedding pipeline.
+ * Generate vector embeddings for documents that are missing embeddings.
+ *
+ * This is a thin wrapper that bridges the Store-based API to the decomposed
+ * embedding pipeline in `src/store/embedding-pipeline.ts`. It queries the
+ * database for hashes that lack embeddings under the configured model,
+ * chunks document bodies, sends them through the LLM embedding endpoint,
+ * and persists the vectors via `insertEmbedding`.
+ *
+ * @param store - The store instance (used for its `db`, `ensureVecTable`, and optional `llm`)
+ * @param options - Embedding options including model, concurrency, retry, and progress callbacks
+ * @returns An {@link EmbedResult} with counts of documents and chunks processed, plus any failures
+ *
+ * **Side effects:** Writes to the `content_vectors` table and may create/update the
+ * vector index table via `ensureVecTable`. Reads from `content` and `documents` tables.
  */
 export async function generateEmbeddings(
   store: Store,
@@ -335,11 +405,24 @@ export async function generateEmbeddings(
 }
 
 /**
- * Create a new store instance with the given database path.
- * If no path is provided, uses the default path (~/.cache/qmd/index.sqlite).
+ * Create a new store instance bound to a SQLite database.
  *
- * @param dbPath - Path to the SQLite database file
- * @returns Store instance with all methods bound to the database
+ * Call once at application startup. The returned {@link Store} has all methods
+ * pre-bound to the database connection and is the entry point for all indexing,
+ * search, and maintenance operations.
+ *
+ * If no path is provided, uses the default path returned by
+ * {@link getDefaultDbPath} (typically `~/.cache/qmd/index.sqlite`).
+ *
+ * @param dbPath - Absolute path to the SQLite database file. If omitted, the
+ *   platform-appropriate default (XDG-compliant cache directory) is used.
+ * @returns A fully initialized {@link Store} instance with all methods bound to the db
+ *
+ * **Side effects:**
+ * - Opens (or creates) the SQLite database at the given path
+ * - Runs schema initialization (`CREATE TABLE IF NOT EXISTS` for all core tables)
+ * - Attempts to load the sqlite-vec extension (logs a warning on failure)
+ * - The returned `.close()` method must be called to release the database handle
  */
 export function createStore(dbPath?: string): Store {
   const resolvedPath = dbPath || getDefaultDbPath();
@@ -426,15 +509,42 @@ export function createStore(dbPath?: string): Store {
 // =============================================================================
 
 /**
- * Unified document result type with all metadata.
- * Body is optional - use getDocumentBody() to load it separately if needed.
+ * Result of attempting to adopt a legacy (pre-fingerprint) embedding to the
+ * current embedding fingerprint.
  */
 export type LegacyFingerprintAdoptionResult = {
+  /** Whether a fingerprint check was attempted (false if no legacy embeddings exist) */
   checked: boolean;
+  /** Number of embedding rows whose fingerprint was updated (0 if none) */
   adopted: number;
+  /** Human-readable explanation of the outcome (skipped, adopted, or why adoption failed) */
   reason: string;
 };
 
+/**
+ * Adopt legacy vector embeddings stored before the embedding fingerprint was introduced
+ * (i.e. `embed_fingerprint = ''`).
+ *
+ * This migration verifies that the current LLM embedding model produces the same vectors
+ * as the legacy model by embedding a sample chunk and comparing it via the sqlite-vec
+ * index. If the sample matches within a tight cosine-distance threshold of 0.0001, all
+ * legacy rows for the given model are bulk-updated with the current fingerprint so they
+ * are no longer considered stale.
+ *
+ * Call this after store creation and before a full re-embed to avoid re-embedding every
+ * document when the fingerprint changed for reasons other than a model swap (e.g. a
+ * format change that doesn't affect output).
+ *
+ * @param store - The store instance whose database will be checked and updated
+ * @param model - The embedding model identifier (defaults to DEFAULT_EMBED_MODEL)
+ * @returns Description of what was found and what action was taken
+ *
+ * **Side effects:**
+ *   - Reads `content_vectors` and `vectors_vec` tables
+ *   - Embeds one sample chunk via the LLM (I/O and computation)
+ *   - May write to `content_vectors.embed_fingerprint` (UPDATE query)
+ *   - Does nothing if `vectors_vec` table is missing
+ */
 export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: string = DEFAULT_EMBED_MODEL): Promise<LegacyFingerprintAdoptionResult> {
   const db = store.db;
   const fingerprint = getEmbeddingFingerprint(model);

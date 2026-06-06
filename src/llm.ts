@@ -1,7 +1,17 @@
 /**
- * llm.ts - LLM abstraction layer for QMD using node-llama-cpp
+ * llm.ts - Barrel / re-export module for the LLM abstraction layer
  *
- * Provides embeddings, text generation, and reranking using local GGUF models.
+ * Collects and re-exports all public symbols from the llm/ sub-modules (types,
+ * model-cache, formatting, llama-cpp, session, singleton) so consumers can
+ * import everything from a single path.
+ *
+ * A few thin function wrappers are defined here to break circular dependencies
+ * between sub-modules:
+ *   - pullModels() — injects the node-llama-cpp loader callback that
+ *     model-cache.ts needs but cannot import directly.
+ *   - formatQueryForEmbedding() / formatDocForEmbedding() — delegate to
+ *     formatting.ts after resolving the active model URI.
+ *   - isQwen3EmbeddingModel() / isRemoteModel() — delegate to formatting.ts.
  */
 
 import {
@@ -26,7 +36,18 @@ import type { LlamaGpuMode, LlamaCppConfig } from "./llm/types.js";
 
 /**
  * Detect if a model URI uses the Qwen3-Embedding format.
- * Qwen3-Embedding uses a different prompting style than nomic/embeddinggemma.
+ *
+ * Qwen3-Embedding uses a different prompting style (instruct format with
+ * task instruction + query/doc) than the default nomic/embeddinggemma style
+ * (task-prefixed or title/text JSON). The embedding store uses this to
+ * select the correct format function.
+ *
+ * Detection rule: returns true when the URI contains "qwen" (case-insensitive)
+ * AND contains "embed" (case-insensitive). Returns false for all other URIs
+ * including local GGUF paths and "hf:" URIs for non-Qwen models.
+ *
+ * @param modelUri - The model URI to check (e.g. "hf:Qwen/Qwen3-Embedding-GGUF")
+ * @returns true if the model is a Qwen3 embedding variant
  */
 export function isQwen3EmbeddingModel(modelUri: string): boolean {
   return isQwen3EmbeddingModelInternal(modelUri);
@@ -34,18 +55,39 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
 
 /**
  * Detect if a model URI refers to a remote API model (not a local GGUF model).
- * Remote models handle their own prompt formatting, so no prefixes should be added.
- * Returns true for model names that don't start with "hf:" and don't end in ".gguf".
+ *
+ * Remote models handle their own prompt formatting, so no local prefixes
+ * (nomic-style task prefixes or Qwen3 instruct templates) should be added.
+ * This check is used by formatQueryForEmbedding and formatDocForEmbedding
+ * to skip formatting when true.
+ *
+ * Detection rule: a model is considered remote when it does NOT start with
+ * "hf:" AND does NOT end with ".gguf". Both Hugging Face URIs
+ * ("hf:org/repo") and local file paths ("/path/to/model.gguf") are treated
+ * as local. Everything else (pure names, OpenAIs, etc.) is remote.
+ *
+ * @param modelUri - The model URI to check
+ * @returns true if the model is remote (non-GGUF, non-HF)
  */
 export function isRemoteModel(modelUri: string): boolean {
   return isRemoteModelInternal(modelUri);
 }
 
 /**
- * Format a query for embedding.
- * Uses nomic-style task prefix format for embeddinggemma (default).
- * Uses Qwen3-Embedding instruct format when a Qwen embedding model is active.
- * Remote models receive raw text — they handle their own formatting.
+ * Format a query string for embedding.
+ *
+ * Applies a model-appropriate prompt template so the embedding model
+ * can distinguish queries from documents. Behaviour depends on the
+ * active embedding model:
+ *   - Default (nomic/embeddinggemma): prepends "search_query: "
+ *   - Qwen3-Embedding: wraps in an instruct-style template with
+ *     task instruction and "Query: " prefix
+ *   - Remote models: returns the raw query text unchanged (the
+ *     remote endpoint handles its own formatting)
+ *
+ * @param query - The raw search query text
+ * @param modelUri - Optional explicit model URI; defaults to resolveEmbedModel()
+ * @returns Formatted query string suitable for the active embedding model
  */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
@@ -53,10 +95,21 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
 }
 
 /**
- * Format a document for embedding.
- * Uses nomic-style format with title and text fields (default).
- * Qwen3-Embedding encodes documents as raw text without special prefixes.
- * Remote models receive raw text — they handle their own formatting.
+ * Format a document chunk for embedding.
+ *
+ * Wraps document text in an embedding-friendly template so the model
+ * can represent the document in vector space. Behaviour depends on the
+ * active embedding model:
+ *   - Default (nomic/embeddinggemma): formats as JSON-like
+ *     "search_document: {\"title\": \"...\", \"text\": \"...\"}"
+ *   - Qwen3-Embedding: returns the raw text without any prefix
+ *   - Remote models: returns the raw text unchanged (remote endpoint
+ *     handles its own formatting)
+ *
+ * @param text - The document text to format
+ * @param title - Optional document title (only used by nomic-style formatters)
+ * @param modelUri - Optional explicit model URI; defaults to resolveEmbedModel()
+ * @returns Formatted document string suitable for the active embedding model
  */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
@@ -109,7 +162,20 @@ export {
   validateGgufFile,
 } from "./llm/model-cache.js";
 
-// pullModels wrapper -- model-cache version requires a node-llama-cpp loader callback
+/**
+ * Download and cache GGUF model files from Hugging Face.
+ *
+ * Wraps the model-cache implementation, injecting the node-llama-cpp
+ * loader callback that resolveModelFile needs to download HF URIs.
+ * This indirection exists because model-cache.ts cannot import
+ * llama-cpp.ts (it would create a circular dependency through the
+ * native module loader).
+ *
+ * @param models - Array of model URIs (e.g. "hf:unsloth/Qwen3-1.7B-GGUF")
+ * @param options.refresh - Re-download even if already cached (default false)
+ * @param options.cacheDir - Override the default model cache directory
+ * @returns Array of PullResult objects with download status per model
+ */
 export async function pullModels(
   models: string[],
   options: { refresh?: boolean; cacheDir?: string } = {}

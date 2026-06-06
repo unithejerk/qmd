@@ -4,7 +4,15 @@
  * Exposes QMD search and document retrieval as MCP tools and resources.
  * Documents are accessible via qmd:// URIs.
  *
+ * Supports two transports:
+ * - **stdio** (default): single-process mode for local AI agent orchestration.
+ * - **Streamable HTTP** (activated via `--http`): JSON-over-HTTP with session
+ *   management, a `/health` endpoint, and a REST-based `/query` shortcut for
+ *   clients that don't speak the full MCP protocol.
+ *
  * Follows MCP spec 2025-06-18 for proper response types.
+ *
+ * @module
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -34,6 +42,21 @@ export type McpStartupOptions = {
   dbPath?: string;
 };
 
+/**
+ * Start the MCP server over stdio transport.
+ *
+ * Use this for local AI agent/IDE integration (Claude Desktop, Cursor, etc.).
+ * Creates the store from the default database path or an explicit `dbPath`,
+ * builds the MCP server with all QMD tools/resources via `createMcpServer`,
+ * and connects via `StdioServerTransport`.
+ *
+ * The server runs until the parent process closes stdin or the process is
+ * terminated. No cleanup handler is required — the process exit handles it.
+ *
+ * @param options.dbPath - Override for the SQLite database path (default: auto-detected).
+ * Side effects: flips `enableProductionMode()`, opens the SQLite DB, registers
+ * MCP tools/resources via createMcpServer.
+ */
 export async function startMcpServer(options: McpStartupOptions = {}): Promise<void> {
   // Opt into production mode when the MCP server is actually started, not
   // when this module is merely imported for its exports. Importing the module
@@ -63,7 +86,29 @@ export type HttpServerHandle = {
 
 /**
  * Start MCP server over Streamable HTTP (JSON responses, no SSE).
- * Binds to localhost only. Returns a handle for shutdown and port discovery.
+ *
+ * Use this when stdio transport is not suitable (e.g. multi-client access,
+ * containerized deployments, or REST API consumers).
+ *
+ * Binds to localhost only. Creates per-session MCP server+transport pairs
+ * (required by the MCP spec) sharing a single stateless SQLite store.
+ *
+ * REST shortcuts:
+ * - `POST /query` or `POST /search` — structured search without MCP handshake.
+ * - `GET /health` — liveness probe returning `{ status, uptime }`.
+ * - `POST /mcp` — full MCP protocol endpoint.
+ *
+ * Registers SIGTERM/SIGINT handlers for graceful shutdown (drains all
+ * sessions, closes the store, then exits).
+ *
+ * @param port - Desired HTTP port. If 0, an ephemeral port is assigned
+ *   (read the actual port from the returned `HttpServerHandle`).
+ * @param options.dbPath - Override for the SQLite database path.
+ * @param options.quiet - Suppress request logging to stderr.
+ * @returns An `HttpServerHandle` with the running server, actual port, and
+ *   a `stop()` function for programmatic shutdown.
+ * Side effects: flips `enableProductionMode()`, opens the SQLite DB, starts
+ * an HTTP listener, registers signal handlers.
  */
 export async function startMcpHttpServer(
   port: number,

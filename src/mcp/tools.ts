@@ -1,8 +1,20 @@
 /**
- * QMD MCP Tools - Tool registration for the MCP server.
+ * QMD MCP Tools - Tool and resource registration for the MCP server.
  *
- * Exports helper functions and the main createMcpServer function that
- * registers all QMD tools, resources, and prompts on an McpServer instance.
+ * Exports `createMcpServer()` which builds a full MCP server instance
+ * registering the following capabilities:
+ *
+ * **Resources:**
+ * - `qmd://{+path}` — read a document by path (line-numbered, with context
+ *   injected as an HTML comment).
+ *
+ * **Tools:**
+ * - `query` — structured multi-signal search (lex/vec/hyde) with reranking.
+ * - `get` — single document retrieval by path or docid, with optional line range.
+ * - `multi_get` — batch document retrieval via glob or comma-separated paths.
+ * - `status` — index health and collection overview.
+ *
+ * @module
  */
 
 import { readFileSync } from "node:fs";
@@ -89,8 +101,19 @@ export function getPackageVersion(): string {
 // =============================================================================
 
 /**
- * Create an MCP server with all QMD tools, resources, and prompts registered.
- * Shared by both stdio and HTTP transports.
+ * Create an MCP server instance with all QMD tools, resources, and prompts
+ * registered. Shared by both stdio (`startMcpServer`) and HTTP
+ * (`startMcpHttpServer`) transports.
+ *
+ * Registers:
+ * - Resource `qmd://{+path}` for reading documents.
+ * - Tools `query`, `get`, `multi_get`, and `status`.
+ * - Server instructions built from the store's collection/context config.
+ *
+ * @param store - An open `QMDStore` instance (created via `createStore` or
+ *   the CLI lifecycle). Must already have its database and LLM configured.
+ * @returns A configured `McpServer` instance ready to be connected to a transport.
+ * Side effects: calls `store.getDefaultCollectionNames()` to pre-fetch defaults.
  */
 export async function createMcpServer(store: QMDStore): Promise<McpServer> {
   const server = new McpServer(

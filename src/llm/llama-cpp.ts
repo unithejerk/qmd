@@ -1,8 +1,24 @@
 /**
- * llm/llama-cpp.ts - LlamaCpp implementation of the LLM interface
+ * llm/llama-cpp.ts - Local GGUF backend for the LLM abstraction layer
  *
- * Provides embeddings, text generation, and reranking using local GGUF models
- * via node-llama-cpp bindings.
+ * Implements the LLM interface via node-llama-cpp bindings to the llama.cpp
+ * library. Supports Metal (Apple Silicon), CUDA, Vulkan, and CPU backends
+ * with automatic GPU detection, lazy initialization, and parallel context
+ * management for embedding and reranking.
+ *
+ * Key design decisions:
+ * - All models, contexts, and the llama runtime are initialized lazily on
+ *   first use (see ensureLlama, ensureEmbedModel, etc.).
+ * - Parallel embedding contexts are created based on available VRAM (GPU)
+ *   or CPU core count, falling back to sequential when only one context
+ *   can be allocated.
+ * - An inactivity timer (default 5 min) unloads contexts to free memory;
+ *   session.ts's reference counting prevents disposal during active use.
+ * - Contexts, models, and the llama runtime are disposed in dependency
+ *   order (contexts first, then models, then the runtime) to avoid
+ *   dangling references in node-llama-cpp's lifecycle management.
+ * - Native build/probe noise that would corrupt stdout for JSON APIs is
+ *   redirected to stderr during node-llama-cpp imports.
  */
 
 import type {
@@ -67,6 +83,18 @@ type ParallelismOptions = {
 // =============================================================================
 
 let nodeLlamaCppImport: Promise<NodeLlamaCppModule> | null = null;
+
+/**
+ * Lazy-load the node-llama-cpp native module.
+ *
+ * Imports node-llama-cpp on first call and caches the promise for all
+ * subsequent calls. During the import, stdout is redirected to stderr
+ * because node-llama-cpp's native probe/build phase writes noisy log
+ * output to stdout that would corrupt JSON-formatted CLI output.
+ *
+ * @returns The loaded NodeLlamaCppModule with getLlama, resolveModelFile,
+ *          LlamaChatSession, and other bindings
+ */
 export async function loadNodeLlamaCpp(): Promise<NodeLlamaCppModule> {
   nodeLlamaCppImport ??= withNativeStdoutRedirectedToStderr(
     () => import("node-llama-cpp") as Promise<NodeLlamaCppModule>
@@ -74,6 +102,15 @@ export async function loadNodeLlamaCpp(): Promise<NodeLlamaCppModule> {
   return nodeLlamaCppImport;
 }
 
+/**
+ * Inject a mock node-llama-cpp module for testing, or reset to null for
+ * real lazy-load on the next call to loadNodeLlamaCpp().
+ *
+ * Also resets the GPU-failure and CPU-warning caches so that tests start
+ * from a clean state.
+ *
+ * @param module - The mock module to inject, or null to reset
+ */
 export function setNodeLlamaCppModuleForTest(module: NodeLlamaCppModule | null): void {
   nodeLlamaCppImport = module ? Promise.resolve(module) : null;
   failedGpuInitModes.clear();
@@ -85,9 +122,19 @@ let nativeStdoutRedirectDepth = 0;
 let originalStdoutWrite: StdoutWrite | null = null;
 
 /**
- * Some node-llama-cpp native build/probe paths write library noise to stdout.
- * JSON APIs must reserve stdout for machine-readable payloads, so route that
- * noise to stderr while native llama initialization is in progress.
+ * Temporarily redirect process.stdout.write to process.stderr.
+ *
+ * node-llama-cpp's native build/probe paths write library noise to stdout,
+ * which would corrupt JSON payloads on stdout. This wrapper routes that
+ * noise to stderr for the duration of the given async function.
+ *
+ * Uses a re-entrant depth counter so nested calls are safe: the first
+ * call installs the redirect, and only the outermost caller restores the
+ * original write function.
+ *
+ * @param fn - The async operation to run with stdout redirected to stderr
+ * @returns The return value of fn
+ * @side-effects Replaces and restores process.stdout.write
  */
 export async function withNativeStdoutRedirectedToStderr<T>(fn: () => Promise<T>): Promise<T> {
   if (nativeStdoutRedirectDepth === 0) {
@@ -115,6 +162,17 @@ export async function withNativeStdoutRedirectedToStderr<T>(fn: () => Promise<T>
 // Helper Functions
 // =============================================================================
 
+/**
+ * Resolve an explicit parallelism override from the QMD_EMBED_PARALLELISM
+ * environment variable.
+ *
+ * When set to a positive integer (1-8), overrides the automatically computed
+ * number of parallel embedding/reranking contexts. Invalid values are
+ * silently ignored with a warning to stderr.
+ *
+ * @param envValue - The environment variable value (defaults to QMD_EMBED_PARALLELISM)
+ * @returns The override count (1-8), or undefined if not set or invalid
+ */
 export function resolveParallelismOverride(envValue = process.env.QMD_EMBED_PARALLELISM): number | undefined {
   const normalized = envValue?.trim() ?? "";
   if (!normalized) return undefined;
@@ -128,6 +186,20 @@ export function resolveParallelismOverride(envValue = process.env.QMD_EMBED_PARA
   return Math.min(8, parsed);
 }
 
+/**
+ * Compute a safe parallelism level, applying platform-specific overrides.
+ *
+ * Applies the explicit QMD_EMBED_PARALLELISM env var override first; if
+ * not set, serializes Windows CUDA to 1 (node-llama-cpp/llama.cpp CUDA on
+ * Windows is unstable with multiple simultaneous contexts —
+ * ggml-cuda.cu:98 in #519). Vulkan and CPU are not affected.
+ *
+ * @param options.gpu - The active GPU backend (string) or false (CPU)
+ * @param options.platform - Platform override (defaults to process.platform)
+ * @param options.computed - The auto-computed parallelism count
+ * @param options.envValue - Env var override value (passed to resolveParallelismOverride)
+ * @returns A safe parallelism count (at least 1)
+ */
 export function resolveSafeParallelism(options: ParallelismOptions): number {
   const override = resolveParallelismOverride(options.envValue);
   if (override !== undefined) return override;
@@ -142,6 +214,22 @@ export function resolveSafeParallelism(options: ParallelismOptions): number {
   return Math.max(1, options.computed);
 }
 
+/**
+ * Resolve the GPU backend mode from environment variables.
+ *
+ * Priority: QMD_FORCE_CPU (any truthy value forces CPU) > QMD_LLAMA_GPU
+ * (auto|metal|vulkan|cuda|false). When not set, returns "auto" for
+ * node-llama-cpp's automatic detection.
+ *
+ * On Apple Silicon, GGML_METAL_NO_RESIDENCY=1 is set from the launcher
+ * (bin/qmd) to prevent Metal static-destructor crashes at process exit —
+ * this is unrelated to the GPU mode selection.
+ *
+ * @param envValue - The QMD_LLAMA_GPU value (defaults to process.env.QMD_LLAMA_GPU)
+ * @param forceCpuValue - The QMD_FORCE_CPU value (defaults to process.env.QMD_FORCE_CPU)
+ * @returns The resolved GPU mode: "auto", "metal", "vulkan", "cuda", or false (CPU)
+ * @throws Never throws; invalid values fall back to "auto" with a warning
+ */
 export function resolveLlamaGpuMode(
   envValue = process.env.QMD_LLAMA_GPU,
   forceCpuValue = process.env.QMD_FORCE_CPU
@@ -160,6 +248,19 @@ export function resolveLlamaGpuMode(
   return "auto";
 }
 
+/**
+ * Dispose a native resource with a timeout guard.
+ *
+ * node-llama-cpp dispose operations can hang indefinitely (e.g. Metal
+ * resource finalization). This wrapper races the dispose call against a
+ * timeout and logs warnings on timeout or error without throwing, ensuring
+ * shutdown can continue even when a resource hangs.
+ *
+ * @param resourceName - Human-readable name for log messages
+ * @param dispose - The dispose function to call
+ * @param timeoutMs - Timeout in milliseconds (default 1000)
+ * @side-effects May write warnings to stderr on timeout or error
+ */
 async function disposeWithTimeout(resourceName: string, dispose: () => Promise<void>, timeoutMs = 1000): Promise<void> {
   const timeoutPromise = new Promise<"timeout">((resolve) => {
     setTimeout(() => resolve("timeout"), timeoutMs).unref();
@@ -177,6 +278,17 @@ async function disposeWithTimeout(resourceName: string, dispose: () => Promise<v
   }
 }
 
+/**
+ * Resolve the context window size for query expansion generation.
+ *
+ * Priority: constructor config (expandContextSize) > QMD_EXPAND_CONTEXT_SIZE
+ * env var > built-in default (2048). The env var path logs a warning for
+ * non-positive-integer values and falls back to the default.
+ *
+ * @param configValue - Optional value from LlamaCppConfig.expandContextSize
+ * @returns The expansion context token budget
+ * @throws {Error} If configValue is provided but is not a positive integer
+ */
 function resolveExpandContextSize(configValue?: number): number {
   if (configValue !== undefined) {
     if (!Number.isInteger(configValue) || configValue <= 0) {
@@ -218,6 +330,32 @@ const DEFAULT_EXPAND_CONTEXT_SIZE = 2048;
 // LlamaCpp Class
 // =============================================================================
 
+/**
+ * LlamaCpp — local GGUF model backend implementing the LLM interface.
+ *
+ * Supports three model roles (embed, generate, rerank), each loaded lazily
+ * from its own GGUF file. Embedding and reranking create multiple parallel
+ * contexts (one per concurrent operation), while generation creates a fresh
+ * context per call.
+ *
+ * ## Backend selection
+ * GPU backend is controlled by QMD_LLAMA_GPU (auto|metal|vulkan|cuda|false).
+ * QMD_FORCE_CPU disables GPU offloading regardless of backend. On GPU,
+ * parallel context count is bounded by VRAM (25% of free); on CPU, by
+ * available math cores (at least 4 threads per context).
+ *
+ * ## Thread safety
+ * Methods can be called concurrently — model load promises guard against
+ * duplicate concurrent initialization, and parallel contexts operate
+ * independently. Only one thread of execution should call dispose().
+ *
+ * ## Inactivity management
+ * An internal inactivity timer (default 5 min via inactivityTimeoutMs)
+ * automatically unloads contexts to free memory. The session.ts reference
+ * counting (canUnloadLLM) prevents disposal during active sessions.
+ *
+ * @implements {LLM}
+ */
 export class LlamaCpp implements LLM {
   private readonly _ciMode = !!process.env.CI;
   private llama: Llama | null = null;
@@ -736,8 +874,18 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
 
   /**
-   * Tokenize text using the embedding model's tokenizer
-   * Returns tokenizer tokens (opaque type from node-llama-cpp)
+   * Tokenize text using the embedding model's tokenizer.
+   *
+   * Returns opaque LlamaToken objects from node-llama-cpp. These can be
+   * passed to detokenize() or counted with countTokens(). The embedding
+   * model's tokenizer is used because token counts must match the context
+   * window that embeddings are computed against.
+   *
+   * @param text - The text to tokenize
+   * @returns Array of LlamaToken objects (opaque node-llama-cpp type)
+   * @throws {Error} If the embedding model is not loaded (should not happen
+   *         after ensureEmbedContext resolves)
+   * @side-effects Ensures embedding context is loaded (lazy init)
    */
   async tokenize(text: string): Promise<readonly LlamaToken[]> {
     await this.ensureEmbedContext();  // Ensure model is loaded
@@ -748,7 +896,14 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Count tokens in text using the embedding model's tokenizer
+   * Count the number of tokens in text using the embedding model's tokenizer.
+   *
+   * Uses tokenize() internally — primarily used for truncation decisions
+   * and context budget calculations.
+   *
+   * @param text - The text to count tokens in
+   * @returns Token count (always >= 0)
+   * @side-effects Ensures embedding context is loaded (lazy init)
    */
   async countTokens(text: string): Promise<number> {
     const tokens = await this.tokenize(text);
@@ -756,7 +911,15 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Detokenize token IDs back to text
+   * Decode token IDs back to their string representation.
+   *
+   * Uses the embedding model's tokenizer for detokenization. Undoes the
+   * effect of tokenize() — useful after truncating token arrays.
+   *
+   * @param tokens - Array of LlamaToken objects from tokenize()
+   * @returns The decoded string
+   * @throws {Error} If the embedding model is not loaded
+   * @side-effects Ensures embedding context is loaded (lazy init)
    */
   async detokenize(tokens: readonly LlamaToken[]): Promise<string> {
     await this.ensureEmbedContext();
@@ -802,6 +965,21 @@ export class LlamaCpp implements LLM {
     return { text: truncatedText, truncated: true, limit: maxTokens };
   }
 
+  /**
+   * Compute a vector embedding for a single text string.
+   *
+   * Automatically resolves the embedding context from the pool (lazy init),
+   * truncates text that exceeds the model's context window to prevent GGML
+   * crashes, and logs a warning on truncation. Returns null on any error
+   * (logged to console.error).
+   *
+   * @param text - The text to embed (will be tokenized and truncated to
+   *               fit the model's context window)
+   * @param options.model - Optional override model URI for the result
+   * @returns Embedding vector and model name, or null on error
+   * @side-effects Touches the inactivity timer; may trigger lazy model/context init
+   * @throws Never throws — errors are caught and returned as null
+   */
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -828,8 +1006,24 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Batch embed multiple texts efficiently
-   * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
+   * Compute vector embeddings for multiple texts in parallel.
+   *
+   * When multiple embedding contexts are available (based on VRAM/core
+   * analysis), texts are split across contexts and evaluated with
+   * Promise.all for true parallelism. When only one context is available,
+   * texts are processed sequentially on that context.
+   *
+   * Each text is independently guarded against truncation. Individual
+   * embedding errors are caught and returned as null in the result array
+   * so a single problematic text does not fail the entire batch.
+   *
+   * @param texts - Array of text strings to embed
+   * @param options.model - Optional override model URI for results
+   * @returns Array of results in the same order as input texts; null entries
+   *          indicate per-item embedding failures
+   * @throws {Error} If CI mode is active (CI env var set)
+   * @side-effects Touches the inactivity timer after each individual embedding;
+   *              may trigger lazy context pool creation
    */
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
@@ -898,6 +1092,24 @@ export class LlamaCpp implements LLM {
     }
   }
 
+  /**
+   * Generate text completion from the generation model.
+   *
+   * Creates a fresh context + sequence + chat session for each call. The
+   * context is disposed in the `finally` block so it is always cleaned up
+   * even on error. Default sampling parameters follow Qwen3 recommendations
+   * for non-thinking mode: temperature=0.7, topP=0.8, topK=20. Greedy
+   * decoding (temperature=0) is explicitly avoided as it causes repetition
+   * loops with Qwen3 models.
+   *
+   * @param prompt - The input prompt text
+   * @param options.maxTokens - Maximum tokens to generate (default 150)
+   * @param options.temperature - Sampling temperature (default 0.7)
+   * @returns The generated text and model URI, or null on failure
+   * @throws {Error} If CI mode is active (CI env var set)
+   * @side-effects Touches the inactivity timer; creates and disposes a
+   *              generation context per call
+   */
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
@@ -940,6 +1152,17 @@ export class LlamaCpp implements LLM {
     }
   }
 
+  /**
+   * Check whether a model URI is available for use.
+   *
+   * Hugging Face URIs ("hf:org/repo") are assumed to always exist (they
+   * will be downloaded on demand). Local filesystem paths are checked
+   * synchronously with existsSync.
+   *
+   * @param modelUri - The model URI to check ("hf:..." or local path)
+   * @returns ModelInfo with name, existence flag, and path if the file
+   *          is present on disk
+   */
   async modelExists(modelUri: string): Promise<ModelInfo> {
     // For HuggingFace URIs, we assume they exist
     // For local paths, check if file exists
@@ -959,6 +1182,31 @@ export class LlamaCpp implements LLM {
   // High-level abstractions
   // ==========================================================================
 
+  /**
+   * Expand a search query into multiple variations for different search backends.
+   *
+   * Uses the generation model with a grammar-constrained prompt to produce
+   * structured output lines prefixed by type ("lex", "vec", "hyde"). Each
+   * type targets a different search backend: lexical (BM25), vector, or
+   * HyDE (hypothetical document embedding). Results are filtered to remove
+   * expansions lacking any query terms.
+   *
+   * A bounded context (expandContextSize, default 2048) prevents large
+   * default VRAM allocations. On grammar parse failure or generation error,
+   * a sensible fallback is returned (original query as vec or lex+vec).
+   *
+   * @param query - The raw user search query
+   * @param options.context - Optional context string prepended to the prompt
+   * @param options.includeLexical - Whether to include "lex" type expansions
+   *                                 (default true)
+   * @param options.intent - Optional query intent description for better
+   *                         expansions
+   * @returns Array of Queryable objects (type + text) for multi-backend search;
+   *          returns fallback entries on any error
+   * @throws {Error} If CI mode is active (CI env var set)
+   * @side-effects Touches the inactivity timer; creates and disposes a
+   *              generation context per call
+   */
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
@@ -1055,6 +1303,29 @@ export class LlamaCpp implements LLM {
   private static readonly RERANK_TEMPLATE_OVERHEAD = 512;
   private static readonly RERANK_TARGET_DOCS_PER_CONTEXT = 10;
 
+  /**
+   * Rerank documents by relevance to a query using the reranker model.
+   *
+   * Each document is truncated to fit within the rerank context budget:
+   * contextSize - template overhead (~512 tokens) - query tokens. Identical
+   * effective texts are deduplicated before scoring to avoid redundant work.
+   * Documents are split across available rerank contexts (up to 4) for
+   * parallel evaluation, with results reassembled and sorted by descending
+   * relevance score.
+   *
+   * Rerank context size defaults to 4096 tokens (configurable via
+   * QMD_RERANK_CONTEXT_SIZE), comfortably fitting the largest real-world
+   * document chunks while staying below the 40k auto-size limit.
+   *
+   * @param query - The search query to evaluate relevance against
+   * @param documents - Array of documents (file + text) to rerank
+   * @param options.model - Optional model URI override for results
+   * @returns RerankResult with sorted results array and model name
+   * @throws {Error} If CI mode is active (CI env var set)
+   * @throws {Error} If no rerank context can be created
+   * @side-effects Touches the inactivity timer; may trigger lazy model and
+   *              context pool initialization
+   */
   async rerank(
     query: string,
     documents: RerankDocument[],
@@ -1180,6 +1451,25 @@ export class LlamaCpp implements LLM {
     };
   }
 
+  /**
+   * Release all native resources managed by this instance.
+   *
+   * Disposes in strict dependency order: contexts first (embedding, then
+   * rerank), then models (embedding, generation, rerank), then the llama
+   * runtime. Each dispose is guarded by a 1-second timeout
+   * (disposeWithTimeout) to prevent hangs from Metal resource finalization
+   * or other native teardown issues.
+   *
+   * This explicit ordering is necessary because relying only on
+   * llama.dispose() leaves Metal resource sets alive until process
+   * finalization on Apple Silicon, where ggml_metal_device_free can abort
+   * after otherwise-successful CLI output (issue #368).
+   *
+   * Safe to call multiple times — subsequent calls are no-ops.
+   *
+   * @side-effects Clears all internal references and timers; may write
+   *              warnings to stderr if dispose operations time out or fail
+   */
   async dispose(): Promise<void> {
     // Prevent double-dispose
     if (this.disposed) {

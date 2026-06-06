@@ -13,6 +13,23 @@ import type { LLM, ILLMSession, LLMSessionOptions, EmbedOptions, EmbeddingResult
 // LLMSessionManager
 // =============================================================================
 
+/**
+ * Reference-counted session manager for an LLM instance.
+ *
+ * Tracks active sessions and in-flight operations to coordinate with the
+ * LlamaCpp inactivity timer. When active sessions exist, canUnload()
+ * returns false, preventing LlamaCpp from disposing contexts that are
+ * currently in use.
+ *
+ * This indirection exists because the inactivity timer (in llama-cpp.ts)
+ * and session management (here) are in different modules — the timer needs
+ * a single source of truth for "is anything using the LLM right now?"
+ *
+ * Reference counting strategy:
+ *   - acquire() / release() track session leases (+1 on create, -1 on release)
+ *   - operationStart() / operationEnd() track in-flight operations
+ *   - canUnload() returns true only when both counts are 0
+ */
 class LLMSessionManager {
   private llm: LLM;
   private _activeSessionCount = 0;
@@ -59,6 +76,18 @@ class LLMSessionManager {
 // SessionReleasedError
 // =============================================================================
 
+/**
+ * Thrown when an operation is attempted on an LLM session that has been
+ * released or aborted.
+ *
+ * This can happen in three scenarios:
+ *   1. The session was explicitly released (via session.release()).
+ *   2. The external AbortSignal (passed via LLMSessionOptions) fired.
+ *   3. The max-duration timer expired (default 10 minutes).
+ *
+ * Callers should catch this error and handle it gracefully (e.g. by
+ * creating a new session or abandoning the operation).
+ */
 export class SessionReleasedError extends Error {
   constructor(message = "LLM session has been released or aborted") {
     super(message);
@@ -70,6 +99,18 @@ export class SessionReleasedError extends Error {
 // LLMSession
 // =============================================================================
 
+/**
+ * Concrete session implementation wrapping an LLMSessionManager.
+ *
+ * Created by withLLMSession() / withLLMSessionForLlm(). Acquires a
+ * reference on the manager in the constructor and releases it in release().
+ * All LLM operations (embed, embedBatch, etc.) are guarded by
+ * withOperation() which checks isValid first and tracks in-flight ops.
+ *
+ * On creation, links an optional external AbortSignal and sets a max-duration
+ * timer (default 10 min). When either fires, the internal AbortController
+ * is aborted and subsequent operations throw SessionReleasedError.
+ */
 class LLMSession implements ILLMSession {
   private manager: LLMSessionManager;
   private released = false;
@@ -183,6 +224,27 @@ function getSessionManager(): LLMSessionManager {
   return defaultSessionManager;
 }
 
+/**
+ * Execute a function within a scoped LLM session.
+ *
+ * Creates a session against the default LLM instance (from getDefaultLlamaCpp()),
+ * calls the callback with the session, and guarantees release in the finally
+ * block. The session's reference count prevents the LlamaCpp inactivity timer
+ * from unloading contexts while the function runs.
+ *
+ * Usage:
+ *   const result = await withLLMSession(async (session) => {
+ *     const emb = await session.embed("text");
+ *     return emb.embedding;
+ *   });
+ *
+ * @param fn - Callback that receives the session
+ * @param options.maxDuration - Max session lifetime in ms (default 600000 = 10 min)
+ * @param options.signal - Optional external AbortSignal
+ * @param options.name - Debug name for logging
+ * @returns The return value of fn
+ * @throws {SessionReleasedError} If the session is released or aborted mid-operation
+ */
 export async function withLLMSession<T>(
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
@@ -197,6 +259,22 @@ export async function withLLMSession<T>(
   }
 }
 
+/**
+ * Execute a function within a scoped LLM session for a specific LLM instance.
+ *
+ * Unlike withLLMSession() which uses the global default, this creates a
+ * dedicated session manager for the given LLM instance. Useful when you
+ * need to use a specific backend (RemoteLLM, test mock) rather than the
+ * default LlamaCpp.
+ *
+ * @param llm - The LLM instance to wrap in a session
+ * @param fn - Callback that receives the session
+ * @param options.maxDuration - Max session lifetime in ms (default 600000 = 10 min)
+ * @param options.signal - Optional external AbortSignal
+ * @param options.name - Debug name for logging
+ * @returns The return value of fn
+ * @throws {SessionReleasedError} If the session is released or aborted mid-operation
+ */
 export async function withLLMSessionForLlm<T>(
   llm: LLM,
   fn: (session: ILLMSession) => Promise<T>,
@@ -212,6 +290,19 @@ export async function withLLMSessionForLlm<T>(
   }
 }
 
+/**
+ * Check whether the default LLM instance can safely unload idle resources.
+ *
+ * Returns false when any session is active or any operation is in-flight,
+ * preventing the LlamaCpp inactivity timer from disposing contexts that
+ * are currently in use. When no default session manager exists (no sessions
+ * ever created), returns true (safe to unload).
+ *
+ * Called by LlamaCpp.touchActivity() via a dynamic import to avoid circular
+ * dependency — see the module-level comment in singleton.ts.
+ *
+ * @returns true if no sessions are active and no operations are in-flight
+ */
 export function canUnloadLLM(): boolean {
   if (!defaultSessionManager) return true;
   return defaultSessionManager.canUnload();

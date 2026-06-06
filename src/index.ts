@@ -1,20 +1,30 @@
 /**
- * QMD SDK - Library mode for programmatic access to QMD search and indexing.
+ * QMD SDK - Public library entry point for programmatic access to QMD
+ * search, indexing, and collection management.
+ *
+ * The primary export is `createStore()`, which wraps the internal SQLite store
+ * with write-through YAML config sync and automatic LlamaCpp lifecycle. All
+ * SDK types (QMDStore, SearchOptions, StoreOptions, etc.) are exported for
+ * consumers writing TypeScript.
  *
  * Usage:
- *   import { createStore } from '@tobilu/qmd'
+ * ```typescript
+ * import { createStore } from '@tobilu/qmd'
  *
- *   const store = await createStore({
- *     dbPath: './my-index.sqlite',
- *     config: {
- *       collections: {
- *         docs: { path: '/path/to/docs', pattern: '**\/*.md' }
- *       }
+ * const store = await createStore({
+ *   dbPath: './my-index.sqlite',
+ *   config: {
+ *     collections: {
+ *       docs: { path: '/path/to/docs', pattern: '**\/*.md' }
  *     }
- *   })
+ *   }
+ * })
  *
- *   const results = await store.search({ query: "how does auth work?" })
- *   await store.close()
+ * const results = await store.search({ query: "how does auth work?" })
+ * await store.close()
+ * ```
+ *
+ * @module
  */
 
 import {
@@ -173,7 +183,9 @@ export interface SearchOptions {
  * Options for searchLex() — BM25 keyword search.
  */
 export interface LexSearchOptions {
+  /** Maximum number of results to return */
   limit?: number;
+  /** Restrict search to a specific collection name */
   collection?: string;
 }
 
@@ -181,7 +193,9 @@ export interface LexSearchOptions {
  * Options for searchVector() — vector similarity search.
  */
 export interface VectorSearchOptions {
+  /** Maximum number of results to return */
   limit?: number;
+  /** Restrict search to a specific collection name */
   collection?: string;
 }
 
@@ -189,6 +203,7 @@ export interface VectorSearchOptions {
  * Options for expandQuery() — manual query expansion.
  */
 export interface ExpandQueryOptions {
+  /** Domain context to steer the LLM's query expansion */
   intent?: string;
 }
 
@@ -229,72 +244,252 @@ export interface QMDStore {
 
   // ── Search ──────────────────────────────────────────────────────────
 
-  /** Full search: query expansion + multi-signal retrieval + LLM reranking */
+  /**
+   * Full search: query expansion + multi-signal retrieval + LLM reranking.
+   *
+   * Accepts either a plain `query` string (auto-expanded via LLM) or
+   * pre-built `queries` array for manual control. Searches across all
+   * collections by default; filter with `collection` or `collections`.
+   *
+   * @param options.query - Plain-text query string (auto-expanded via LLM).
+   * @param options.queries - Pre-expanded typed queries (skips auto-expansion).
+   * @param options.intent - Domain context to disambiguate the query.
+   * @param options.rerank - Whether to rerank results with LLM (default true).
+   * @param options.collection - Single collection name to restrict search.
+   * @param options.collections - Multiple collection names (OR match).
+   * @param options.limit - Max results to return (default 10).
+   * @param options.candidateLimit - Max candidates to rerank (default 40).
+   * @param options.minScore - Minimum relevance score threshold.
+   * @param options.explain - Include retrieval score traces in results.
+   * @param options.chunkStrategy - "auto" (AST-aware) or "regex" (default "auto").
+   * @returns Ranked results with scores, snippets, and per-result context.
+   */
   search(options: SearchOptions): Promise<HybridQueryResult[]>;
 
-  /** BM25 keyword search (fast, no LLM) */
+  /**
+   * BM25 keyword search (fast, no LLM).
+   *
+   * Runs a raw FTS5 query against the SQLite full-text index. Supports
+   * quoted phrases, negation, and prefix matching via FTS5 syntax.
+   *
+   * @param query - Keyword query string (FTS5 syntax: "phrase", -negation).
+   * @param options.limit - Max results (default: configured or 10).
+   * @param options.collection - Restrict to a single collection.
+   * @returns Flat search results with file path, title, body, and BM25 score.
+   */
   searchLex(query: string, options?: LexSearchOptions): Promise<SearchResult[]>;
 
-  /** Vector similarity search (embedding model, no reranking) */
+  /**
+   * Vector similarity search via embedding model (no BM25, no reranking).
+   *
+   * Embeds the query using the configured embed model and finds the nearest
+   * neighbors by cosine similarity. Pure semantic search — independent of
+   * keyword overlap.
+   *
+   * @param query - Natural language query string.
+   * @param options.limit - Max results (default: configured or 10).
+   * @param options.collection - Restrict to a single collection.
+   * @returns Search results with file path, title, body, and similarity score.
+   */
   searchVector(query: string, options?: VectorSearchOptions): Promise<SearchResult[]>;
 
-  /** Expand a query into typed sub-searches (lex/vec/hyde) for manual control */
+  /**
+   * Expand a plain query into typed sub-searches (lex/vec/hyde) using the LLM.
+   *
+   * Useful when you want to inspect or modify the expansion before passing
+   * the result to `search({ queries })`. Skips expansion if the LLM is not
+   * available.
+   *
+   * @param query - The raw user query string to expand.
+   * @param options.intent - Optional domain context to steer expansion.
+   * @returns An array of typed queries (lex, vec, hyde) for use with `search()`.
+   */
   expandQuery(query: string, options?: ExpandQueryOptions): Promise<ExpandedQuery[]>;
 
   // ── Document Retrieval ──────────────────────────────────────────────
 
-  /** Get a single document by path or docid */
+  /**
+   * Get a single document by path or docid (#abc123).
+   *
+   * Resolves both filesystem paths (absolute, relative, ~-prefixed) and
+   * qmd:// URIs. Also accepts short docids (first 6 hash chars, with or
+   * without leading #). On miss, returns a DocumentNotFound with similar
+   * file suggestions.
+   *
+   * @param pathOrDocid - File path, qmd:// URI, or docid (#abc123).
+   * @param options.includeBody - Whether to include the full document body
+   *   in the result (default: false — only metadata is returned).
+   * @returns Document metadata + optional body, or a not-found result with
+   *   similar file suggestions.
+   */
   get(pathOrDocid: string, options?: { includeBody?: boolean }): Promise<DocumentResult | DocumentNotFound>;
 
-  /** Get the body content of a document, optionally sliced by line range */
+  /**
+   * Get the raw body content of a document, optionally sliced by line range.
+   *
+   * Use this when you already have a DocumentResult and only need the body
+   * text (e.g., for feeding into an LLM). Returns `null` if the document
+   * cannot be found.
+   *
+   * @param pathOrDocid - File path, qmd:// URI, or docid (#abc123).
+   * @param opts.fromLine - Start at this 1-indexed line number.
+   * @param opts.maxLines - Maximum number of lines to return.
+   * @returns The document body text, or `null` if not found.
+   */
   getDocumentBody(pathOrDocid: string, opts?: { fromLine?: number; maxLines?: number }): Promise<string | null>;
 
-  /** Get multiple documents by glob pattern or comma-separated list */
+  /**
+   * Get multiple documents by glob pattern or comma-separated list.
+   *
+   * Accepts:
+   * - Glob patterns (e.g., `journals/2025-05*.md`)
+   * - Comma-separated lists of paths or docids
+   *
+   * Files exceeding `maxBytes` are returned as skipped entries with a reason
+   * string, rather than being silently omitted.
+   *
+   * @param pattern - Glob pattern or comma-separated path/docid list.
+   * @param options.includeBody - Whether to fetch the full document body.
+   * @param options.maxBytes - Skip files larger than this (default 10240).
+   * @returns Object with `docs` (results, possibly skipped) and `errors`
+   *   (per-file error messages for unmatched items).
+   */
   multiGet(pattern: string, options?: { includeBody?: boolean; maxBytes?: number }): Promise<{ docs: MultiGetResult[]; errors: string[] }>;
 
   // ── Collection Management ───────────────────────────────────────────
 
-  /** Add or update a collection */
+  /**
+   * Add or update a collection in the store.
+   *
+   * Writes to the SQLite store and, if a YAML or inline config was provided
+   * at store creation, also writes through to that config.
+   *
+   * @param name - Unique collection name (used in qmd:// URIs).
+   * @param opts.path - Absolute filesystem path to index.
+   * @param opts.pattern - Glob pattern for file matching (default **\/*.md).
+   * @param opts.ignore - Glob patterns to exclude from indexing.
+   */
   addCollection(name: string, opts: { path: string; pattern?: string; ignore?: string[] }): Promise<void>;
 
-  /** Remove a collection */
+  /**
+   * Remove a collection and its indexed documents from the store.
+   *
+   * Also renames the collection in YAML/inline config if one was provided.
+   *
+   * @param name - The collection name to remove.
+   * @returns `true` if the collection was found and removed.
+   */
   removeCollection(name: string): Promise<boolean>;
 
-  /** Rename a collection */
+  /**
+   * Rename a collection. Updates all virtual paths (qmd://old/ -> qmd://new/).
+   *
+   * Also renames in YAML/inline config if one was provided.
+   *
+   * @param oldName - Current collection name.
+   * @param newName - New collection name.
+   * @returns `true` if the collection was found and renamed.
+   */
   renameCollection(oldName: string, newName: string): Promise<boolean>;
 
-  /** List all collections with document stats */
+  /**
+   * List all collections with document stats.
+   *
+   * @returns Array of collection descriptors including file counts and
+   *   last-modified timestamps. `includeByDefault` indicates whether the
+   *   collection participates in unqualified searches.
+   */
   listCollections(): Promise<{ name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null; includeByDefault: boolean }[]>;
 
-  /** Get names of collections included by default in queries */
+  /**
+   * Get names of collections that are included by default in unqualified queries.
+   *
+   * @returns Array of collection names where `includeByDefault` is true.
+   */
   getDefaultCollectionNames(): Promise<string[]>;
 
   // ── Context Management ──────────────────────────────────────────────
 
-  /** Add context for a path within a collection */
+  /**
+   * Add human-written context for a path within a collection.
+   *
+   * Context is injected into search results for matching documents,
+   * helping LLMs interpret file contents without reading them in full.
+   *
+   * @param collectionName - The collection name.
+   * @param pathPrefix - Path prefix within the collection (empty string or
+   *   "/" for collection root context).
+   * @param contextText - Descriptive text about the files at this path.
+   * @returns `true` if added successfully.
+   */
   addContext(collectionName: string, pathPrefix: string, contextText: string): Promise<boolean>;
 
-  /** Remove context from a collection path */
+  /**
+   * Remove context from a collection path.
+   *
+   * @param collectionName - The collection name.
+   * @param pathPrefix - Path prefix to remove context for.
+   * @returns `true` if context was found and removed.
+   */
   removeContext(collectionName: string, pathPrefix: string): Promise<boolean>;
 
-  /** Set global context (applies to all collections) */
+  /**
+   * Set or clear global context (applies to all collections).
+   *
+   * @param context - The context text, or `undefined` to clear global context.
+   */
   setGlobalContext(context: string | undefined): Promise<void>;
 
-  /** Get global context */
+  /**
+   * Get the global context string.
+   *
+   * @returns The global context text, or `undefined` if not set.
+   */
   getGlobalContext(): Promise<string | undefined>;
 
-  /** List all contexts across all collections */
+  /**
+   * List all contexts across all collections.
+   *
+   * @returns Array of context entries with collection name, path prefix,
+   *   and context text.
+   */
   listContexts(): Promise<Array<{ collection: string; path: string; context: string }>>;
 
   // ── Indexing ────────────────────────────────────────────────────────
 
-  /** Re-index collections by scanning the filesystem */
+  /**
+   * Re-index all (or specified) collections by scanning the filesystem.
+   *
+   * Scans each collection's path for matching files, detects new, updated,
+   * unchanged, and removed documents, and updates the SQLite index. Clears
+   * the Ollama model cache before starting.
+   *
+   * @param options.collections - Restrict to specific collection names.
+   * @param options.onProgress - Callback invoked per-file with progress info.
+   * @returns Aggregated counts across all processed collections.
+   */
   update(options?: {
     collections?: string[];
     onProgress?: (info: UpdateProgress) => void;
   }): Promise<UpdateResult>;
 
-  /** Generate vector embeddings for documents that need them */
+  /**
+   * Generate vector embeddings for documents that need them.
+   *
+   * Chunks document bodies (respecting AST boundaries for code files),
+   * embeds each chunk using the configured model, and stores vectors in
+   * the sqlite-vec index. Only processes hashes that don't already have
+   * embeddings, unless `force` is true.
+   *
+   * @param options.force - Re-embed all documents even if already embedded.
+   * @param options.model - Override the embedding model name.
+   * @param options.collection - Restrict to a single collection.
+   * @param options.maxDocsPerBatch - Cap docs per embedding batch.
+   * @param options.maxBatchBytes - Cap UTF-8 bytes per embedding batch.
+   * @param options.chunkStrategy - "auto" (AST-aware for code) or "regex".
+   * @param options.onProgress - Progress callback with byte/chunk counts.
+   * @returns Embed result with counts of chunks/documents processed.
+   */
   embed(options?: {
     force?: boolean;
     model?: string;
@@ -308,15 +503,32 @@ export interface QMDStore {
 
   // ── Index Health ────────────────────────────────────────────────────
 
-  /** Get index status (document counts, collections, embedding state) */
+  /**
+   * Get index status: document counts, collection list, embedding state,
+   * and vector index presence.
+   *
+   * @returns An IndexStatus object with totals, per-collection breakdown,
+   *   and health indicators.
+   */
   getStatus(): Promise<IndexStatus>;
 
-  /** Get index health info (stale embeddings, etc.) */
+  /**
+   * Get index health information, including a list of documents whose
+   * content hashes have changed since their last embedding.
+   *
+   * @returns Health info with stale-embedding warnings and repair suggestions.
+   */
   getIndexHealth(): Promise<IndexHealthInfo>;
 
   // ── Lifecycle ───────────────────────────────────────────────────────
 
-  /** Close the store and release all resources (LLM models, DB connection) */
+  /**
+   * Close the store and release all resources.
+   *
+   * Disposes the LLM model instances, closes the SQLite database connection,
+   * and resets the config source to its pre-open state.
+   * Safe to call multiple times — subsequent calls are no-ops.
+   */
   close(): Promise<void>;
 }
 
