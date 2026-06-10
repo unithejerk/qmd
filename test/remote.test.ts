@@ -36,6 +36,28 @@ import { modelExists, probe } from '../src/remote/probe.js';
 import { RemoteLLM } from '../src/remote/remote-llm.js';
 import type { EndpointConfig } from '../src/remote/types.js';
 
+// ── Phase 2 imports — OpenAI protocol adapters and shared helpers ─────
+
+import {
+  normalizeChatCompletionText,
+  normalizeCompletionsText,
+  normalizeResponseAPIText,
+  normalizeModelName,
+} from '../src/remote/adapters/normalization.js';
+import {
+  openaiChatCompletionsExpandAdapter,
+  openaiChatCompletionsGenerateAdapter,
+} from '../src/remote/adapters/openai-chat.js';
+import {
+  openaiCompletionsExpandAdapter,
+  openaiCompletionsGenerateAdapter,
+} from '../src/remote/adapters/openai-completions.js';
+import {
+  openaiResponsesExpandAdapter,
+  openaiResponsesGenerateAdapter,
+} from '../src/remote/adapters/openai-responses.js';
+import { resolveAdapterBundle } from '../src/remote/adapters/registry.js';
+
 // =============================================================================
 // Helpers — mock HTTP server
 // =============================================================================
@@ -1019,5 +1041,840 @@ describe('RemoteLLM', () => {
     }, silentLogger);
     expect(llm.embedCfg.baseUrl).toBe('http://old:8000/v1');
     expect(llm.embedModelName).toBe('old-model');
+  });
+});
+
+// =============================================================================
+// Phase 2 — Shared normalization helpers
+// =============================================================================
+
+describe('normalizeChatCompletionText', () => {
+  test('extracts message content from standard response', () => {
+    const data = {
+      choices: [{ message: { content: 'Hello, world!' } }],
+      model: 'gpt-4',
+    };
+    expect(normalizeChatCompletionText(data)).toBe('Hello, world!');
+  });
+
+  test('returns empty string for missing choices', () => {
+    expect(normalizeChatCompletionText({ model: 'm' })).toBe('');
+    expect(normalizeChatCompletionText({})).toBe('');
+    expect(normalizeChatCompletionText(null)).toBe('');
+    expect(normalizeChatCompletionText(undefined)).toBe('');
+  });
+
+  test('returns empty string for empty choices array', () => {
+    expect(normalizeChatCompletionText({ choices: [] })).toBe('');
+  });
+
+  test('returns empty string when content is missing', () => {
+    expect(normalizeChatCompletionText({
+      choices: [{ message: {} }],
+    })).toBe('');
+  });
+
+  test('handles non-object data gracefully', () => {
+    expect(normalizeChatCompletionText('string')).toBe('');
+    expect(normalizeChatCompletionText(42)).toBe('');
+  });
+
+  test('extracts text from content blocks array (multimodal shape)', () => {
+    const data = {
+      choices: [{
+        message: {
+          content: [
+            { type: 'text', text: 'Hello from blocks' },
+            { type: 'image_url', image_url: { url: '...' } },
+          ],
+        },
+      }],
+    };
+    expect(normalizeChatCompletionText(data)).toBe('Hello from blocks');
+  });
+
+  test('returns empty for content blocks without text type', () => {
+    const data = {
+      choices: [{
+        message: {
+          content: [{ type: 'image_url', image_url: { url: '...' } }],
+        },
+      }],
+    };
+    expect(normalizeChatCompletionText(data)).toBe('');
+  });
+});
+
+describe('normalizeCompletionsText', () => {
+  test('extracts text from legacy completions response', () => {
+    const data = {
+      choices: [{ text: 'Generated text', index: 0 }],
+      model: 'gpt-3.5-turbo-instruct',
+    };
+    expect(normalizeCompletionsText(data)).toBe('Generated text');
+  });
+
+  test('returns empty string for malformed data', () => {
+    expect(normalizeCompletionsText(null)).toBe('');
+    expect(normalizeCompletionsText({})).toBe('');
+    expect(normalizeCompletionsText({ choices: [] })).toBe('');
+  });
+});
+
+describe('normalizeResponseAPIText', () => {
+  test('extracts text from output_text blocks', () => {
+    const data = {
+      output: [
+        {
+          type: 'message',
+          content: [
+            { type: 'output_text', text: 'Response text here' },
+          ],
+        },
+      ],
+      model: 'gpt-4o',
+    };
+    expect(normalizeResponseAPIText(data)).toBe('Response text here');
+  });
+
+  test('skips non-message output types', () => {
+    const data = {
+      output: [
+        { type: 'reasoning', content: '...' },
+        {
+          type: 'message',
+          content: [
+            { type: 'output_text', text: 'Actual response' },
+          ],
+        },
+      ],
+    };
+    expect(normalizeResponseAPIText(data)).toBe('Actual response');
+  });
+
+  test('returns empty string when no message output', () => {
+    expect(normalizeResponseAPIText({ output: [{ type: 'reasoning' }] })).toBe('');
+    expect(normalizeResponseAPIText({ output: [] })).toBe('');
+    expect(normalizeResponseAPIText(null)).toBe('');
+  });
+
+  test('handles top-level output_text shortcut', () => {
+    const data = { output_text: 'direct output text' };
+    expect(normalizeResponseAPIText(data)).toBe('direct output text');
+  });
+
+  test('handles content blocks with type: "text" variant', () => {
+    const data = {
+      output: [
+        {
+          type: 'message',
+          content: [{ type: 'text', text: 'Variant text shape' }],
+        },
+      ],
+    };
+    expect(normalizeResponseAPIText(data)).toBe('Variant text shape');
+  });
+
+  test('prefers output_text over text when both present', () => {
+    const data = {
+      output: [
+        {
+          type: 'message',
+          content: [
+            { type: 'output_text', text: 'output_text wins' },
+            { type: 'text', text: 'text variant' },
+          ],
+        },
+      ],
+    };
+    expect(normalizeResponseAPIText(data)).toBe('output_text wins');
+  });
+});
+
+describe('normalizeModelName', () => {
+  test('extracts model name from response', () => {
+    expect(normalizeModelName({ model: 'gpt-4o' }, 'fallback')).toBe('gpt-4o');
+  });
+
+  test('returns fallback when model is missing', () => {
+    expect(normalizeModelName({}, 'fallback')).toBe('fallback');
+    expect(normalizeModelName(null, 'fallback')).toBe('fallback');
+  });
+});
+
+// =============================================================================
+// Phase 2 — Adapter registry: format → adapter mapping
+// =============================================================================
+
+describe('resolveAdapterBundle (Phase 2)', () => {
+  function ecfg(overrides?: Partial<EndpointConfig>): EndpointConfig {
+    return {
+      baseUrl: 'http://localhost:1',
+      model: 'm',
+      apiKey: 'sk',
+      format: 'auto',
+      ...overrides,
+    };
+  }
+
+  test('auto format resolves to legacy adapters', () => {
+    const bundle = resolveAdapterBundle({
+      embed: ecfg({ format: 'auto' }),
+      expand: ecfg({ format: 'auto' }),
+      rerank: ecfg({ format: 'auto' }),
+      generate: ecfg({ format: 'auto' }),
+    });
+    expect(bundle.expand.id).toBe('legacy/openai-chat-expand');
+    expect(bundle.generate.id).toBe('legacy/openai-chat-generate');
+  });
+
+  test('openai_chat_completions resolves to chat adapter', () => {
+    const bundle = resolveAdapterBundle({
+      embed: ecfg(),
+      expand: ecfg({ format: 'openai_chat_completions' }),
+      rerank: ecfg(),
+      generate: ecfg({ format: 'openai_chat_completions' }),
+    });
+    expect(bundle.expand.id).toBe('openai/chat-completions-expand');
+    expect(bundle.generate.id).toBe('openai/chat-completions-generate');
+  });
+
+  test('openai_completions resolves to completions adapter', () => {
+    const bundle = resolveAdapterBundle({
+      embed: ecfg(),
+      expand: ecfg({ format: 'openai_completions' }),
+      rerank: ecfg(),
+      generate: ecfg({ format: 'openai_completions' }),
+    });
+    expect(bundle.expand.id).toBe('openai/completions-expand');
+    expect(bundle.generate.id).toBe('openai/completions-generate');
+  });
+
+  test('openai_responses resolves to responses adapter', () => {
+    const bundle = resolveAdapterBundle({
+      embed: ecfg(),
+      expand: ecfg({ format: 'openai_responses' }),
+      rerank: ecfg(),
+      generate: ecfg({ format: 'openai_responses' }),
+    });
+    expect(bundle.expand.id).toBe('openai/responses-expand');
+    expect(bundle.generate.id).toBe('openai/responses-generate');
+  });
+
+  test('anthropic_messages still uses legacy (deferred to Phase 3)', () => {
+    const bundle = resolveAdapterBundle({
+      embed: ecfg(),
+      expand: ecfg({ format: 'anthropic_messages' }),
+      rerank: ecfg(),
+      generate: ecfg({ format: 'anthropic_messages' }),
+    });
+    expect(bundle.expand.id).toBe('legacy/openai-chat-expand');
+    expect(bundle.generate.id).toBe('legacy/openai-chat-generate');
+  });
+
+  test('falls back to legacy on unrecognized format', () => {
+    // Missing format defaults to auto → legacy
+    const bundle = resolveAdapterBundle({
+      embed: ecfg({ format: undefined }),
+      expand: ecfg({ format: undefined }),
+      rerank: ecfg({ format: undefined }),
+      generate: ecfg({ format: undefined }),
+    });
+    expect(bundle.expand.id).toBe('legacy/openai-chat-expand');
+    expect(bundle.generate.id).toBe('legacy/openai-chat-generate');
+  });
+
+  test('embed and rerank adapters unchanged (Phase 2 only touches expand/generate)', () => {
+    const bundle = resolveAdapterBundle({
+      embed: ecfg({ format: 'auto' }),
+      expand: ecfg({ format: 'openai_chat_completions' }),
+      rerank: ecfg({ format: 'auto' }),
+      generate: ecfg({ format: 'openai_chat_completions' }),
+    });
+    expect(bundle.embed.id).toBe('legacy/openai-embeddings');
+    expect(bundle.rerank.id).toBe('legacy/cohere-rerank');
+  });
+});
+
+// =============================================================================
+// Phase 2 — openai_chat_completions adapter: expand + generate
+// =============================================================================
+
+describe('openaiChatCompletionsExpandAdapter', () => {
+  function makeCtx(url: string): Parameters<typeof openaiChatCompletionsExpandAdapter.expandQuery>[0] {
+    return {
+      cfg: { baseUrl: url, model: 'm', apiKey: 'sk-test' },
+      breaker: new CircuitBreaker(),
+      log: silentLogger,
+      readTimeoutMs: 5000,
+    };
+  }
+
+  test('expandQuery sends chat completions request and parses response', async () => {
+    let receivedBody: any = null;
+    const server = startMockServer(async (req, res) => {
+      receivedBody = await readBody(req);
+      jsonRes(res, 200, {
+        choices: [{
+          message: {
+            // All variants contain "topic" so all pass term-overlap validation
+            content: 'lex: topic keywords\nvec: topic paraphrase\nhyde: A document about topic',
+          },
+        }],
+      });
+    });
+
+    const result = await openaiChatCompletionsExpandAdapter.expandQuery(
+      makeCtx(server.url), 'topic', {},
+    );
+
+    expect(receivedBody.messages).toHaveLength(2);
+    expect(receivedBody.messages[0].role).toBe('system');
+    expect(receivedBody.messages[1].role).toBe('user');
+    expect(receivedBody.messages[1].content).toContain('topic');
+    expect(result).toHaveLength(3);
+    expect(result[0]!.type).toBe('lex');
+    await server.close();
+  });
+
+  test('returns passthrough when no API key', async () => {
+    const log = spyLogger();
+    const ctx = makeCtx('http://localhost:1');
+    ctx.cfg.apiKey = '';
+    ctx.log = log;
+
+    const result = await openaiChatCompletionsExpandAdapter.expandQuery(ctx, 'test', {});
+    expect(result).toEqual([{ type: 'lex', text: 'test' }]);
+    expect(log.calls.some((c) => c.msg.includes('no API key'))).toBe(true);
+  });
+
+  test('falls back when circuit breaker is open', async () => {
+    const log = spyLogger();
+    const breaker = new CircuitBreaker(1);
+    breaker.onFailure();
+    const ctx = makeCtx('http://localhost:1');
+    ctx.breaker = breaker;
+    ctx.log = log;
+
+    const result = await openaiChatCompletionsExpandAdapter.expandQuery(ctx, 'test', {});
+    expect(result).toHaveLength(3);
+    expect(log.calls.some((c) => c.msg.includes('circuit breaker is open'))).toBe(true);
+  });
+
+  test('falls back on malformed response', async () => {
+    const log = spyLogger();
+    const server = startMockServer((_req, res) => {
+      jsonRes(res, 200, {
+        choices: [{ message: { content: 'unparseable garbage' } }],
+      });
+    });
+
+    const ctx = makeCtx(server.url);
+    ctx.log = log;
+    const result = await openaiChatCompletionsExpandAdapter.expandQuery(ctx, 'topic', {});
+
+    expect(result).toHaveLength(3);
+    expect(log.calls.some((c) => c.msg.includes('could not parse'))).toBe(true);
+    await server.close();
+  });
+
+  test('falls back on empty response content', async () => {
+    const server = startMockServer((_req, res) => {
+      jsonRes(res, 200, { choices: [{ message: { content: '' } }] });
+    });
+
+    const ctx = makeCtx(server.url);
+    const result = await openaiChatCompletionsExpandAdapter.expandQuery(ctx, 'query', {});
+    expect(result).toHaveLength(3); // fallback
+    await server.close();
+  });
+
+  test('falls back on network error', async () => {
+    const log = spyLogger();
+    const ctx = makeCtx('http://localhost:1');
+    ctx.log = log;
+    ctx.readTimeoutMs = 100;
+
+    const result = await openaiChatCompletionsExpandAdapter.expandQuery(ctx, 'query', {});
+    expect(result).toHaveLength(3);
+    expect(log.calls.some((c) => c.level === 'error')).toBe(true);
+  });
+
+  test('includes intent in user prompt when provided', async () => {
+    let receivedBody: any = null;
+    const server = startMockServer(async (req, res) => {
+      receivedBody = await readBody(req);
+      jsonRes(res, 200, {
+        choices: [{
+          // All contain "dog" so pass term-overlap
+          message: { content: 'lex: dog search\nvec: dog query\nhyde: A document about dogs' },
+        }],
+      });
+    });
+
+    const ctx = makeCtx(server.url);
+    await openaiChatCompletionsExpandAdapter.expandQuery(ctx, 'dog', { intent: 'information-seeking' });
+
+    expect(receivedBody.messages[1].content).toContain('information-seeking');
+    await server.close();
+  });
+});
+
+describe('openaiChatCompletionsGenerateAdapter', () => {
+  function makeCtx(url: string): Parameters<typeof openaiChatCompletionsGenerateAdapter.generate>[0] {
+    return {
+      cfg: { baseUrl: url, model: 'm', apiKey: 'sk-test' },
+      breaker: new CircuitBreaker(),
+      log: silentLogger,
+      readTimeoutMs: 5000,
+    };
+  }
+
+  test('returns generated text from chat completions', async () => {
+    const server = startMockServer((_req, res) => {
+      jsonRes(res, 200, {
+        choices: [{ message: { content: 'Generated response' } }],
+        model: 'gen-model',
+      });
+    });
+
+    const result = await openaiChatCompletionsGenerateAdapter.generate(
+      makeCtx(server.url), 'prompt',
+    );
+
+    expect(result!.text).toBe('Generated response');
+    expect(result!.model).toBe('gen-model');
+    expect(result!.done).toBe(true);
+    await server.close();
+  });
+
+  test('passes maxTokens and temperature from options', async () => {
+    let receivedBody: any = null;
+    const server = startMockServer(async (req, res) => {
+      receivedBody = await readBody(req);
+      jsonRes(res, 200, {
+        choices: [{ message: { content: 'ok' } }],
+        model: 'm',
+      });
+    });
+
+    await openaiChatCompletionsGenerateAdapter.generate(
+      makeCtx(server.url), 'test', { maxTokens: 42, temperature: 0.3 },
+    );
+
+    expect(receivedBody.max_tokens).toBe(42);
+    expect(receivedBody.temperature).toBe(0.3);
+    await server.close();
+  });
+
+  test('returns null on circuit breaker open', async () => {
+    const log = spyLogger();
+    const breaker = new CircuitBreaker(1);
+    breaker.onFailure();
+    const ctx = makeCtx('http://localhost:1');
+    ctx.breaker = breaker;
+    ctx.log = log;
+
+    const result = await openaiChatCompletionsGenerateAdapter.generate(ctx, 'prompt');
+    expect(result).toBeNull();
+    expect(log.calls.some((c) => c.msg.includes('circuit breaker is open'))).toBe(true);
+  });
+
+  test('returns null on network error', async () => {
+    const log = spyLogger();
+    const ctx = makeCtx('http://localhost:1');
+    ctx.log = log;
+    ctx.readTimeoutMs = 100;
+
+    const result = await openaiChatCompletionsGenerateAdapter.generate(ctx, 'prompt');
+    expect(result).toBeNull();
+    expect(log.calls.some((c) => c.level === 'error')).toBe(true);
+  });
+
+  test('returns empty text for empty content response', async () => {
+    const server = startMockServer((_req, res) => {
+      jsonRes(res, 200, {
+        choices: [{ message: { content: '' } }],
+        model: 'm',
+      });
+    });
+
+    const result = await openaiChatCompletionsGenerateAdapter.generate(
+      makeCtx(server.url), 'prompt',
+    );
+
+    expect(result!.text).toBe('');
+    expect(result!.done).toBe(true);
+    await server.close();
+  });
+});
+
+// =============================================================================
+// Phase 2 — openai_completions adapter: expand + generate
+// =============================================================================
+
+describe('openaiCompletionsExpandAdapter', () => {
+  function makeCtx(url: string): Parameters<typeof openaiCompletionsExpandAdapter.expandQuery>[0] {
+    return {
+      cfg: { baseUrl: url, model: 'm', apiKey: 'sk-test' },
+      breaker: new CircuitBreaker(),
+      log: silentLogger,
+      readTimeoutMs: 5000,
+    };
+  }
+
+  test('sends combined prompt to /completions endpoint', async () => {
+    let receivedBody: any = null;
+    const server = startMockServer(async (req, res) => {
+      receivedBody = await readBody(req);
+      jsonRes(res, 200, {
+        choices: [{ text: 'lex: search kw\nvec: search vec\nhyde: search hyde', index: 0 }],
+        model: 'm',
+      });
+    });
+
+    const result = await openaiCompletionsExpandAdapter.expandQuery(
+      makeCtx(server.url), 'search', {},
+    );
+
+    // Completions endpoint: single prompt string, no messages array
+    expect(typeof receivedBody.prompt).toBe('string');
+    expect(receivedBody.prompt).toContain('search query expansion');
+    expect(receivedBody.prompt).toContain('search');
+    expect(result).toHaveLength(3);
+    await server.close();
+  });
+
+  test('returns passthrough when no API key', async () => {
+    const ctx = makeCtx('http://localhost:1');
+    ctx.cfg.apiKey = '';
+    const result = await openaiCompletionsExpandAdapter.expandQuery(ctx, 'test', {});
+    expect(result).toEqual([{ type: 'lex', text: 'test' }]);
+  });
+
+  test('falls back when circuit breaker is open', async () => {
+    const breaker = new CircuitBreaker(1);
+    breaker.onFailure();
+    const ctx = makeCtx('http://localhost:1');
+    ctx.breaker = breaker;
+
+    const result = await openaiCompletionsExpandAdapter.expandQuery(ctx, 'test', {});
+    expect(result).toHaveLength(3);
+  });
+
+  test('falls back on malformed response', async () => {
+    const log = spyLogger();
+    const server = startMockServer((_req, res) => {
+      jsonRes(res, 200, { choices: [{ text: 'not formatted at all', index: 0 }] });
+    });
+
+    const ctx = makeCtx(server.url);
+    ctx.log = log;
+    const result = await openaiCompletionsExpandAdapter.expandQuery(ctx, 'topic', {});
+
+    expect(result).toHaveLength(3);
+    expect(log.calls.some((c) => c.msg.includes('could not parse'))).toBe(true);
+    await server.close();
+  });
+});
+
+describe('openaiCompletionsGenerateAdapter', () => {
+  function makeCtx(url: string): Parameters<typeof openaiCompletionsGenerateAdapter.generate>[0] {
+    return {
+      cfg: { baseUrl: url, model: 'm', apiKey: 'sk-test' },
+      breaker: new CircuitBreaker(),
+      log: silentLogger,
+      readTimeoutMs: 5000,
+    };
+  }
+
+  test('extracts text from choices[0].text', async () => {
+    const server = startMockServer((_req, res) => {
+      jsonRes(res, 200, {
+        choices: [{ text: 'Completions output', index: 0 }],
+        model: 'gpt-3.5-turbo-instruct',
+      });
+    });
+
+    const result = await openaiCompletionsGenerateAdapter.generate(
+      makeCtx(server.url), 'prompt',
+    );
+
+    expect(result!.text).toBe('Completions output');
+    expect(result!.model).toBe('gpt-3.5-turbo-instruct');
+    await server.close();
+  });
+
+  test('sends prompt as a plain string', async () => {
+    let receivedBody: any = null;
+    const server = startMockServer(async (req, res) => {
+      receivedBody = await readBody(req);
+      jsonRes(res, 200, {
+        choices: [{ text: 'ok', index: 0 }],
+        model: 'm',
+      });
+    });
+
+    await openaiCompletionsGenerateAdapter.generate(
+      makeCtx(server.url), 'my plain prompt', { maxTokens: 50 },
+    );
+
+    expect(receivedBody.prompt).toBe('my plain prompt');
+    expect(receivedBody.max_tokens).toBe(50);
+    await server.close();
+  });
+
+  test('returns null on error', async () => {
+    const log = spyLogger();
+    const ctx = makeCtx('http://localhost:1');
+    ctx.log = log;
+    ctx.readTimeoutMs = 100;
+
+    const result = await openaiCompletionsGenerateAdapter.generate(ctx, 'prompt');
+    expect(result).toBeNull();
+    expect(log.calls.some((c) => c.level === 'error')).toBe(true);
+  });
+});
+
+// =============================================================================
+// Phase 2 — openai_responses adapter: expand + generate
+// =============================================================================
+
+describe('openaiResponsesExpandAdapter', () => {
+  function makeCtx(url: string): Parameters<typeof openaiResponsesExpandAdapter.expandQuery>[0] {
+    return {
+      cfg: { baseUrl: url, model: 'm', apiKey: 'sk-test' },
+      breaker: new CircuitBreaker(),
+      log: silentLogger,
+      readTimeoutMs: 5000,
+    };
+  }
+
+  test('sends request to /responses with instructions + input', async () => {
+    let receivedBody: any = null;
+    const server = startMockServer(async (req, res) => {
+      receivedBody = await readBody(req);
+      jsonRes(res, 200, {
+        output: [
+          {
+            type: 'message',
+            content: [
+              {
+                type: 'output_text',
+                // All contain "search" — pass term-overlap
+                text: 'lex: search kw\nvec: search vec\nhyde: search hyde',
+              },
+            ],
+          },
+        ],
+        model: 'gpt-4o',
+      });
+    });
+
+    const result = await openaiResponsesExpandAdapter.expandQuery(
+      makeCtx(server.url), 'search', {},
+    );
+
+    expect(typeof receivedBody.instructions).toBe('string');
+    expect(typeof receivedBody.input).toBe('string');
+    expect(receivedBody.max_output_tokens).toBe(600);
+    expect(result).toHaveLength(3);
+    await server.close();
+  });
+
+  test('returns passthrough when no API key', async () => {
+    const ctx = makeCtx('http://localhost:1');
+    ctx.cfg.apiKey = '';
+    const result = await openaiResponsesExpandAdapter.expandQuery(ctx, 'test', {});
+    expect(result).toEqual([{ type: 'lex', text: 'test' }]);
+  });
+
+  test('falls back on network error', async () => {
+    const log = spyLogger();
+    const ctx = makeCtx('http://localhost:1');
+    ctx.log = log;
+    ctx.readTimeoutMs = 100;
+
+    const result = await openaiResponsesExpandAdapter.expandQuery(ctx, 'query', {});
+    expect(result).toHaveLength(3);
+    expect(log.calls.some((c) => c.level === 'error')).toBe(true);
+  });
+
+  test('falls back on empty output', async () => {
+    const server = startMockServer((_req, res) => {
+      jsonRes(res, 200, { output: [], model: 'm' });
+    });
+
+    const ctx = makeCtx(server.url);
+    const result = await openaiResponsesExpandAdapter.expandQuery(ctx, 'query', {});
+    expect(result).toHaveLength(3);
+    await server.close();
+  });
+});
+
+describe('openaiResponsesGenerateAdapter', () => {
+  function makeCtx(url: string): Parameters<typeof openaiResponsesGenerateAdapter.generate>[0] {
+    return {
+      cfg: { baseUrl: url, model: 'm', apiKey: 'sk-test' },
+      breaker: new CircuitBreaker(),
+      log: silentLogger,
+      readTimeoutMs: 5000,
+    };
+  }
+
+  test('extracts text from output_text blocks', async () => {
+    const server = startMockServer((_req, res) => {
+      jsonRes(res, 200, {
+        output: [
+          {
+            type: 'message',
+            content: [{ type: 'output_text', text: 'Response API output' }],
+          },
+        ],
+        model: 'gpt-4o',
+      });
+    });
+
+    const result = await openaiResponsesGenerateAdapter.generate(
+      makeCtx(server.url), 'prompt',
+    );
+
+    expect(result!.text).toBe('Response API output');
+    expect(result!.model).toBe('gpt-4o');
+    await server.close();
+  });
+
+  test('sends input as string and uses max_output_tokens', async () => {
+    let receivedBody: any = null;
+    const server = startMockServer(async (req, res) => {
+      receivedBody = await readBody(req);
+      jsonRes(res, 200, {
+        output: [{ type: 'message', content: [{ type: 'output_text', text: 'ok' }] }],
+        model: 'm',
+      });
+    });
+
+    await openaiResponsesGenerateAdapter.generate(
+      makeCtx(server.url), 'my prompt', { maxTokens: 256, temperature: 0.5 },
+    );
+
+    expect(receivedBody.input).toBe('my prompt');
+    expect(receivedBody.max_output_tokens).toBe(256);
+    expect(receivedBody.temperature).toBe(0.5);
+    await server.close();
+  });
+
+  test('returns null on circuit breaker open', async () => {
+    const breaker = new CircuitBreaker(1);
+    breaker.onFailure();
+    const ctx = makeCtx('http://localhost:1');
+    ctx.breaker = breaker;
+
+    const result = await openaiResponsesGenerateAdapter.generate(ctx, 'prompt');
+    expect(result).toBeNull();
+  });
+
+  test('returns null on network error', async () => {
+    const log = spyLogger();
+    const ctx = makeCtx('http://localhost:1');
+    ctx.log = log;
+    ctx.readTimeoutMs = 100;
+
+    const result = await openaiResponsesGenerateAdapter.generate(ctx, 'prompt');
+    expect(result).toBeNull();
+    expect(log.calls.some((c) => c.level === 'error')).toBe(true);
+  });
+});
+
+// =============================================================================
+// Phase 2 — RemoteLLM integration with explicit format selection
+// =============================================================================
+
+describe('RemoteLLM with Phase 2 formats', () => {
+  test('RemoteLLM expandQuery uses chat completions format via new adapter', async () => {
+    let requestedPath = '';
+    const server = startMockServer((req, res) => {
+      requestedPath = req.url ?? '';
+      jsonRes(res, 200, {
+        choices: [{ message: { content: 'lex: test kw\nvec: test vec\nhyde: test hyde' } }],
+        model: 'm',
+      });
+    });
+
+    const llm = new RemoteLLM({
+      expand: { baseUrl: server.url, model: 'm', apiKey: 'sk', format: 'openai_chat_completions' },
+    }, silentLogger);
+
+    const result = await llm.expandQuery('test');
+    expect(result).toHaveLength(3);
+    expect(requestedPath).toBe('/chat/completions');
+    await llm.dispose();
+    await server.close();
+  });
+
+  test('RemoteLLM generate uses completions format via new adapter', async () => {
+    let requestedPath = '';
+    let receivedBody: any = null;
+    const server = startMockServer(async (req, res) => {
+      requestedPath = req.url ?? '';
+      receivedBody = await readBody(req);
+      jsonRes(res, 200, {
+        choices: [{ text: 'completions output', index: 0 }],
+        model: 'gpt-3.5',
+      });
+    });
+
+    const llm = new RemoteLLM({
+      generate: { baseUrl: server.url, model: 'm', apiKey: 'sk', format: 'openai_completions' },
+    }, silentLogger);
+
+    const result = await llm.generate('prompt text');
+    expect(result!.text).toBe('completions output');
+    expect(requestedPath).toBe('/completions');
+    expect(receivedBody.prompt).toBe('prompt text');
+    await llm.dispose();
+    await server.close();
+  });
+
+  test('RemoteLLM generate uses responses format via new adapter', async () => {
+    let requestedPath = '';
+    const server = startMockServer((req, res) => {
+      requestedPath = req.url ?? '';
+      jsonRes(res, 200, {
+        output: [{ type: 'message', content: [{ type: 'output_text', text: 'responses output' }] }],
+        model: 'gpt-4o',
+      });
+    });
+
+    const llm = new RemoteLLM({
+      generate: { baseUrl: server.url, model: 'm', apiKey: 'sk', format: 'openai_responses' },
+    }, silentLogger);
+
+    const result = await llm.generate('prompt');
+    expect(result!.text).toBe('responses output');
+    expect(requestedPath).toBe('/responses');
+    await llm.dispose();
+    await server.close();
+  });
+
+  test('auto format still uses legacy and hits /chat/completions', async () => {
+    let requestedPath = '';
+    const server = startMockServer((req, res) => {
+      requestedPath = req.url ?? '';
+      jsonRes(res, 200, {
+        choices: [{ message: { content: 'answer' } }],
+        model: 'm',
+      });
+    });
+
+    const llm = new RemoteLLM({
+      generate: { baseUrl: server.url, model: 'm', apiKey: 'sk', format: 'auto' },
+    }, silentLogger);
+
+    const result = await llm.generate('test');
+    expect(result!.text).toBe('answer');
+    expect(requestedPath).toBe('/chat/completions'); // legacy also uses chat completions
+    await llm.dispose();
+    await server.close();
   });
 });
