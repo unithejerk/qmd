@@ -6,8 +6,6 @@
  * request/response shapes but shares error-handling semantics,
  * circuit-breaker gating, and fallback behavior.
  *
- * Phase 2 extracted shared patterns. Phase 3 added Anthropic support.
- *
  * @module remote/adapters/normalization
  */
 

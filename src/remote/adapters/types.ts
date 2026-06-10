@@ -1,8 +1,8 @@
 /**
  * Adapter contracts for remote endpoint protocols.
  *
- * Phase 1 introduces these interfaces so RemoteLLM can delegate endpoint
- * behavior to pluggable adapters instead of embedding protocol-specific logic
+ * These interfaces allow RemoteLLM to delegate endpoint behavior to
+ * pluggable adapters instead of embedding protocol-specific logic
  * in the orchestration class.
  */
 

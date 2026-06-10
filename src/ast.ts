@@ -375,12 +375,12 @@ export async function getASTStatus(): Promise<{
 }
 
 // =============================================================================
-// Symbol Extraction (Phase 2 Stub)
+// Symbol Extraction (Stub)
 // =============================================================================
 
 /**
  * Metadata about a code symbol within a chunk.
- * Stubbed for Phase 2 — always returns empty array in Phase 1.
+ * Currently returns an empty array — symbol extraction is not yet implemented.
  */
 export interface SymbolInfo {
   name: string;
@@ -391,7 +391,7 @@ export interface SymbolInfo {
 
 /**
  * Extract symbol metadata for code within a byte range.
- * Stubbed for Phase 2 — returns empty array.
+ * Currently returns an empty array — symbol extraction is not yet implemented.
  */
 export function extractSymbols(
   _content: string,

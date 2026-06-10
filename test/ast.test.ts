@@ -328,11 +328,11 @@ describe("getASTBreakPoints - error handling", () => {
 });
 
 // =============================================================================
-// Symbol Extraction Stub (Phase 2)
+// Symbol Extraction Stub
 // =============================================================================
 
 describe("extractSymbols", () => {
-  test("returns empty array (Phase 2 stub)", () => {
+  test("returns empty array (stub)", () => {
     const symbols = extractSymbols("function foo() {}", "typescript", 0, 18);
     expect(symbols).toEqual([]);
   });

@@ -398,63 +398,256 @@ The SDK requires explicit `dbPath` — no defaults are assumed. This makes it sa
 
 ## Architecture
 
+### System Overview
+
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         QMD Hybrid Search Pipeline                          │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│                                     QMD System Architecture                              │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────┐  ┌──────────────────────────┐  ┌──────────────────────────┐
+  │        CLI (qmd)         │  │     MCP Server (stdio +   │  │     SDK / Library        │
+  │  ┌────────────────────┐  │  │        HTTP daemon)      │  │  ┌────────────────────┐  │
+  │  │ • query (hybrid)   │  │  │  ┌────────────────────┐  │  │  │ createStore()      │  │
+  │  │ • search (BM25)    │  │  │  │ Tools: query, get, │  │  │  │ store.search()     │  │
+  │  │ • vsearch (vector) │  │  │  │ multi_get, status  │  │  │  │ store.get()        │  │
+  │  │ • embed            │  │  │  └────────┬───────────┘  │  │  │ store.addContext() │  │
+  │  │ • update (reindex) │  │  │           │              │  │  └────────┬───────────┘  │
+  │  │ • context add/rm   │  │  │  ┌────────┴───────────┐  │  │           │              │
+  │  │ • collection mgmt  │  │  │  │ stdio transport     │  │  │           │              │
+  │  │ • multi-get / ls   │  │  │  │ HTTP transport      │  │  │           │              │
+  │  └────────┬───────────┘  │  │  │ (SSE streamable)    │  │  │           │              │
+  │           │              │  │  └────────────────────┘  │  │           │              │
+  └───────────┼──────────────┘  └────────────┬─────────────┘  └───────────┼──────────────┘
+              │                              │                              │
+              └──────────────────────────────┼──────────────────────────────┘
+                                             │
+                                             ▼
+  ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+  │                                   Store (src/store.ts)                                    │
+  │  ┌───────────────────┐  ┌───────────────────┐  ┌───────────────────┐                      │
+  │  │   Query Engine    │  │     Retrieval     │  │    Embedding      │                      │
+  │  │  (query-engine)   │  │   (retrieval.ts)  │  │    Pipeline       │                      │
+  │  │  ┌─────────────┐  │  │  ┌─────────────┐  │  │ (embedding-pipe)  │                      │
+  │  │  │ hybridQuery │  │  │  │ searchFTS   │  │  │  ┌─────────────┐  │                      │
+  │  │  │ vSearch     │  │  │  │ searchVec   │  │  │  │ generate    │  │                      │
+  │  │  │ structured  │  │  │  │ rrfFusion   │  │  │  │ Embeddings  │  │                      │
+  │  │  │ expandQuery │  │  │  │ getContext  │  │  │  └─────────────┘  │                      │
+  │  │  │ rerank      │  │  │  └─────────────┘  │  │                   │                      │
+  │  │  └─────────────┘  │  │                   │  │  ┌─────────────┐  │                      │
+  │  └───────────────────┘  └───────────────────┘  │  │  Chunking   │  │                      │
+  │                                                 │  │  regex+AST  │  │                      │
+  │  ┌───────────────────┐  ┌───────────────────┐  │  └─────────────┘  │                      │
+  │  │    Collections    │  │   Cache + Maint   │  │                   │                      │
+  │  │  (collections.ts) │  │  ┌─────────────┐  │  │  ┌─────────────┐  │                      │
+  │  │  YAML config      │  │  │ LLM cache   │  │  │  │  Document   │  │                      │
+  │  │  context per-path │  │  │ cleanup     │  │  │  │  Ops /      │  │                      │
+  │  │  update commands  │  │  │ vacuum      │  │  │  │  Reindex    │  │                      │
+  │  └───────────────────┘  │  └─────────────┘  │  │  └─────────────┘  │                      │
+  │                         └───────────────────┘  └───────────────────┘                      │
+  └──────────────────────────────────────┬───────────────────────────────────────────────────┘
+                                         │
+              ┌──────────────────────────┼──────────────────────────┐
+              │                          │                          │
+              ▼                          ▼                          ▼
+  ┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐
+  │    LLM Abstraction   │  │    Remote LLM HTTP   │  │    YAML Config       │
+  │    (src/llm.ts)      │  │    (src/remote/)     │  │  ~/.config/qmd/      │
+  │                      │  │                      │  │  index.yml           │
+  │  ┌────────────────┐  │  │  ┌────────────────┐  │  │                      │
+  │  │ node-llama-cpp │  │  │  │ RemoteLLM      │  │  │  • Collection defs  │
+  │  │ (local GGUF)   │  │  │  │ (HTTP client)  │  │  │  • Path contexts    │
+  │  │                │  │  │  │                │  │  │  • Model URLs/keys  │
+  │  │ • embedBatch   │  │  │  │ ┌────────────┐ │  │  │  • API formats      │
+  │  │ • expandQuery  │  │  │  │ │ Circuit    │ │  │  └──────────────────────┘
+  │  │ • rerank       │  │  │  │ │ Breaker    │ │  │
+  │  │ • generate     │  │  │  │ │ (retry)    │ │  │
+  │  └────────────────┘  │  │  │ └────────────┘ │  │
+  │                      │  │  │                │  │
+  │  Model Cache:        │  │  │ ┌────────────┐ │  │
+  │  ~/.cache/qmd/models │  │  │ │ Transport  │ │  │
+  │  (HF auto-download)  │  │  │ │ (fetch)    │ │  │
+  │                      │  │  │ └────────────┘ │  │
+  │                      │  │  └────────────────┘  │
+  │                      │  │                      │
+  │                      │  │  ┌────────────────┐  │
+  │                      │  │  │   Adapters     │  │
+  │                      │  │  │  ┌──────────┐  │  │
+  │                      │  │  │  │ OpenAI   │  │  │
+  │                      │  │  │  │ Cohere   │  │  │
+  │                      │  │  │  │ Ollama   │  │  │
+  │                      │  │  │  │ vLLM     │  │  │
+  │                      │  │  │  │ Anthropic│  │  │
+  │                      │  │  │  │ Legacy   │  │  │
+  │                      │  │  │  └──────────┘  │  │
+  │                      │  │  └────────────────┘  │
+  │                      │  │                      │
+  │                      │  │  Remote Tokenizer    │
+  │                      │  │  /tokenize endpoint  │
+  │                      │  │                      │
+  └──────────┬───────────┘  └──────────┬───────────┘
+             │                         │
+             │    implements           │    implements
+             │    LLM interface        │    LLM interface
+             └────────────┬────────────┘
+                          │
+                          ▼
+  ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+  │                              SQLite Database (~/.cache/qmd/)                              │
+  │  ┌──────────────┐  ┌───────────────┐  ┌──────────────┐  ┌──────────────┐                  │
+  │  │  FTS5 Index  │  │ sqlite-vec    │  │   Content    │  │   Metadata   │                  │
+  │  │  (BM25)      │  │ (embeddings)  │  │   (docs)     │  │  (documents, │                  │
+  │  │              │  │               │  │              │  │   contexts,  │                  │
+  │  │ full-text    │  │ cosine-sim    │  │ raw text +   │  │   collection │                  │
+  │  │ keyword      │  │ vector search │  │ dedup by     │  │   config,    │                  │
+  │  │ search       │  │               │  │ content hash │  │   llm_cache) │                  │
+  │  └──────────────┘  └───────────────┘  └──────────────┘  └──────────────┘                  │
+  └──────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### LLM Backend: Local vs Remote
+
+```
+                              ┌─────────────────────────┐
+                              │     LLM Interface        │
+                              │     (src/llm/types.ts)   │
+                              │                          │
+                              │  embed / embedBatch      │
+                              │  expandQuery             │
+                              │  rerank                  │
+                              │  generate / modelExists  │
+                              └────────────┬────────────┘
+                                           │
+                     ┌─────────────────────┴─────────────────────┐
+                     │                                           │
+                     ▼                                           ▼
+  ┌──────────────────────────────────┐    ┌──────────────────────────────────┐
+  │        Local (llama-cpp)         │    │         Remote (HTTP)            │
+  │        (src/llm/llama-cpp.ts)    │    │     (src/remote/remote-llm.ts)   │
+  │                                  │    │                                  │
+  │  ┌────────────────────────────┐  │    │  ┌────────────────────────────┐  │
+  │  │ node-llama-cpp bindings   │  │    │  │ Per-endpoint config        │  │
+  │  │ • embeddinggemma (300M)   │  │    │  │ • env vars  > YAML > def.  │  │
+  │  │ • qwen3-reranker (0.6B)   │  │    │  │ • QMD_{ROLE}_BASE_URL      │  │
+  │  │ • qmd-expansion (1.7B)    │  │    │  │ • QMD_{ROLE}_API_FORMAT    │  │
+  │  │ • Qwen3-Embedding (opt)   │  │    │  └────────────────────────────┘  │
+  │  └────────────────────────────┘  │    │                                  │
+  │                                  │    │  ┌────────────────────────────┐  │
+  │  GPU backends:                   │    │  │ Circuit Breaker            │  │
+  │  • Metal / CUDA / Vulkan / CPU   │    │  │ (exponential backoff,      │  │
+  │                                  │    │  │  half-open recovery)       │  │
+  │  Session mgmt:                   │    │  └────────────────────────────┘  │
+  │  • 5-min idle disposal           │    │                                  │
+  │  • lazy re-creation              │    │  ┌────────────────────────────┐  │
+  │                                  │    │  │ Protocol Adapters          │  │
+  │  Prompt formatting:              │    │  │ ┌────────┬───────────────┐ │  │
+  │  • Nomic (embeddinggemma)        │    │  │ │ Format │ Adapter       │ │  │
+  │  • Qwen3 instruct (embed+gen)    │    │  │ ├────────┼───────────────┤ │  │
+  │                                  │    │  │ │openai  │ chat/complet/ │ │  │
+  └──────────────────────────────────┘    │  │ │        │ responses     │ │  │
+                                          │  │ ├────────┼───────────────┤ │  │
+                                          │  │ │cohere  │ embed, rerank │ │  │
+                                          │  │ ├────────┼───────────────┤ │  │
+                                          │  │ │ollama  │ embed, text   │ │  │
+                                          │  │ ├────────┼───────────────┤ │  │
+                                          │  │ │vllm    │ pooling,score │ │  │
+                                          │  │ ├────────┼───────────────┤ │  │
+                                          │  │ │anthrop │ messages      │ │  │
+                                          │  │ └────────┴───────────────┘ │  │
+                                          │  └────────────────────────────┘  │
+                                          └──────────────────────────────────┘
+```
+
+### Hybrid Query Pipeline
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│                              QMD Hybrid Search Pipeline                                   │
+│                         (qmd query — the full retrieval flow)                             │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 
                               ┌─────────────────┐
                               │   User Query    │
                               └────────┬────────┘
                                        │
-                        ┌──────────────┴──────────────┐
-                        ▼                             ▼
-               ┌────────────────┐            ┌────────────────┐
-               │ Query Expansion│            │  Original Query│
-               │  (fine-tuned)  │            │   (×2 weight)  │
-               └───────┬────────┘            └───────┬────────┘
-                       │                             │
-                       │ 2 alternative queries       │
-                       └──────────────┬──────────────┘
-                                      │
-              ┌───────────────────────┼───────────────────────┐
-              ▼                       ▼                       ▼
-     ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-     │ Original Query  │     │ Expanded Query 1│     │ Expanded Query 2│
-     └────────┬────────┘     └────────┬────────┘     └────────┬────────┘
-              │                       │                       │
-      ┌───────┴───────┐       ┌───────┴───────┐       ┌───────┴───────┐
-      ▼               ▼       ▼               ▼       ▼               ▼
-  ┌───────┐       ┌───────┐ ┌───────┐     ┌───────┐ ┌───────┐     ┌───────┐
-  │ BM25  │       │Vector │ │ BM25  │     │Vector │ │ BM25  │     │Vector │
-  │(FTS5) │       │Search │ │(FTS5) │     │Search │ │(FTS5) │     │Search │
-  └───┬───┘       └───┬───┘ └───┬───┘     └───┬───┘ └───┬───┘     └───┬───┘
-      │               │         │             │         │             │
-      └───────┬───────┘         └──────┬──────┘         └──────┬──────┘
-              │                        │                       │
-              └────────────────────────┼───────────────────────┘
-                                       │
                                        ▼
                           ┌───────────────────────┐
-                          │   RRF Fusion + Bonus  │
-                          │  Original query: ×2   │
-                          │  Top-rank bonus: +0.05│
-                          │     Top 30 Kept       │
+                          │     BM25 Probe        │
+                          │  Strong signal (>0.5)?│
+                          │  Yes → skip expansion │
+                          │  No  → expand query   │
+                          └───────────┬───────────┘
+                                      │
+                          ┌───────────┴───────────┐
+                          ▼                       ▼
+                 ┌────────────────┐      ┌────────────────┐
+                 │ Query Expansion│      │  Original Query│
+                 │  LLM (expand)  │      │   (×2 weight)  │
+                 │                │      │                │
+                 │ local: qmd-1.7B│      │ +1-2 HyDE var. │
+                 │ remote: OpenAI │      │ (optional LLM   │
+                 │  / Anthropic   │      │  generation)    │
+                 └───────┬────────┘      └───────┬────────┘
+                         │                       │
+                         │ expanded sub-queries  │
+                         └───────────┬───────────┘
+                                     │
+              ┌──────────────────────┼──────────────────────┐
+              ▼                      ▼                      ▼
+     ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+     │   Lexical (FTS) │    │  Vector (embed) │    │  HyDE (embed)   │
+     │   BM25 keyword  │    │  ┌───────────┐  │    │  ┌───────────┐  │
+     │   search        │    │  │ local:    │  │    │  │ local:    │  │
+     │                 │    │  │ embed-gem │  │    │  │ embed-gem │  │
+     │                 │    │  │ remote:   │  │    │  │ remote:   │  │
+     │                 │    │  │ OpenAI    │  │    │  │ OpenAI    │  │
+     │                 │    │  │ Cohere    │  │    │  │ Cohere    │  │
+     │                 │    │  │ Ollama    │  │    │  │ Ollama    │  │
+     │                 │    │  │ vLLM      │  │    │  │ vLLM      │  │
+     │                 │    │  └───────────┘  │    │  └───────────┘  │
+     └────────┬────────┘    └────────┬────────┘    └────────┬────────┘
+              │                      │                      │
+              └──────────────────────┼──────────────────────┘
+                                     │
+                                     ▼
+                          ┌───────────────────────┐
+                          │     RRF Fusion        │
+                          │  k=60, weighted       │
+                          │  Original query: ×2.0 │
+                          │  Expansions:     ×1.0 │
+                          │  Top-rank bonus:+0.05 │
+                          │  ── Top 30 kept ──    │
                           └───────────┬───────────┘
                                       │
                                       ▼
                           ┌───────────────────────┐
-                          │    LLM Re-ranking     │
-                          │  (qwen3-reranker)     │
-                          │  Yes/No + logprobs    │
+                          │  Chunk + Cross-encoder│
+                          │       Rerank          │
+                          │                       │
+                          │ Chunk top candidates  │
+                          │ → rerank per-chunk    │
+                          │ ┌───────────────────┐ │
+                          │ │ local: qwen3-0.6B │ │
+                          │ │ remote: Cohere    │ │
+                          │ │ / vLLM Score API  │ │
+                          │ └───────────────────┘ │
                           └───────────┬───────────┘
                                       │
                                       ▼
                           ┌───────────────────────┐
-                          │  Position-Aware Blend │
-                          │  Top 1-3:  75% RRF    │
-                          │  Top 4-10: 60% RRF    │
-                          │  Top 11+:  40% RRF    │
+                          │  Position-Aware       │
+                          │    Score Blend        │
+                          │                       │
+                          │ Rank 1-3:  75% RRF    │
+                          │ Rank 4-10: 60% RRF    │
+                          │ Rank 11+:  40% RRF    │
+                          └───────────┬───────────┘
+                                      │
+                                      ▼
+                          ┌───────────────────────┐
+                          │    Final Results      │
+                          │  (score + snippet +   │
+                          │   docid + context)    │
                           └───────────────────────┘
 ```
 

@@ -23,9 +23,6 @@ export type ContextMap = Record<string, string>;
 
 /**
  * Supported wire-protocol formats for remote endpoints.
- *
- * Phase 0 defines config contract and validation only. Protocol-specific
- * adapter behavior is implemented in later phases.
  */
 export type RemoteApiFormat =
   | 'auto'

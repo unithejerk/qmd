@@ -4,12 +4,42 @@
 
 ### Changes
 
-- Config: add YAML config fields for remote API endpoints to `models:` section in `index.yml`: `embed_api_url/model/key`, `expand_api_url/model/key`, `rerank_api_url/model/key`, `generate_api_url/model/key`. These allow all remote endpoints to be configured via YAML instead of only environment variables. Env vars still take precedence over YAML values.
-- Config: local-first defaults — ALL endpoints (embed, expand, rerank, generate) default to empty (local LlamaCpp). No remote URLs are assumed. Users must explicitly configure any remote endpoints via env vars or YAML. The previous default of `http://localhost:11434/v1` for embed has been removed.
-- CLI: `RemoteLLM` now reads YAML config for all endpoints (embed, expand, rerank, generate) via `remoteConfigFromEnv()`, enabling `qmd` to use remote endpoints without setting environment variables.
-- API: `isRemoteConfigured()` now detects remote mode from YAML `embed_api_url`, `expand_api_url`, `rerank_api_url`, `generate_api_url` fields in addition to env vars. Setting any remote URL automatically activates remote mode without needing `QMD_EMBED_PROVIDER=remote`.
-- API: `isRemoteConfigured()` now accepts an optional `ModelsConfig` parameter and considers `expand_api_url`, `generate_api_url`, and `rerank_api_url` fields when detecting remote LLM mode.
-- API: `ModelsConfig` now includes `rerank_api_url`, `rerank_api_model`, `rerank_api_key` fields alongside the existing expand/generate fields.
+- **Remote LLM subsystem** (`src/remote/`): new `RemoteLLM` class implementing QMD's `LLM` interface over HTTP, enabling per-role delegation to remote APIs (embed, expand, rerank, generate). Roles are independent — mix local GGUF with remote providers per endpoint.
+- **Protocol adapter layer** (`src/remote/adapters/`): format-agnostic adapter registry that normalizes provider-specific wire protocols into QMD's internal types. Supported formats: OpenAI (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`), Cohere (`/v2/embed`, `/v1/rerank`, `/v2/rerank`), Ollama (`/api/embed`, `/api/chat`, `/api/generate`), vLLM (`/pooling`, `/score`), Anthropic (`/v1/messages`), and legacy (`auto` — OpenAI-compatible `/v1/embeddings` and `/v1/chat/completions`).
+- **Endpoint fallback and caching**: adapters cache the last successful endpoint path, request shape, and input type per base URL. On failure, they probe alternatives (e.g. `/v2/embed` → `/embed`, `/score` → `/v1/score`, `inputs` → `texts` payload shape, `search_query` → `query` input type). Non-recoverable errors (dimension mismatch) bypass retry.
+- **Circuit breaker** (`src/remote/circuit-breaker.ts`): per-endpoint fault isolation with three states (closed, open, half-open). Consecutive failures open the breaker; a cooldown period transitions to half-open for one probe request. Prevents cascading failures when a remote endpoint is down.
+- **HTTP transport** (`src/remote/transport.ts`): low-level `nodePost`/`nodeGet` using Node's native `http`/`https` modules with keep-alive agents, 10MB response body cap, and configurable timeouts. Avoids the Node v24 undici `ByteString` bug that crashes on Unicode response bodies from OpenRouter.
+- **Remote tokenizer** (`src/remote/tokenizer.ts`): vLLM-compatible `/tokenize` and `/detokenize` endpoints for exact token-aware chunking when using remote embedding providers. Auto-detected in remote mode, with character-based fallback.
+- **Query/document embedding intent**: `isQuery: true` forwarded through batch embedding paths in hybrid and structured search, so remote providers that support query/document embedding modes (Cohere `input_type`, etc.) can improve retrieval quality.
+- **Config**: add YAML config fields for remote API endpoints to `models:` section in `index.yml`: `embed_api_url/model/key/format`, `expand_api_url/model/key/format`, `rerank_api_url/model/key/format`, `generate_api_url/model/key/format`. Per-endpoint `*_api_format` selects the wire protocol. Env vars (`QMD_{ROLE}_BASE_URL`, `QMD_{ROLE}_API_FORMAT`, etc.) take precedence over YAML values.
+- **Config**: local-first defaults — ALL endpoints default to empty (local LlamaCpp). No remote URLs are assumed. The previous default of `http://localhost:11434/v1` for embed has been removed. Remote mode activates automatically when any remote endpoint URL is configured via env vars or YAML.
+- **Config**: `isRemoteConfigured()` now accepts an optional `ModelsConfig` parameter and considers all four endpoint URL fields when detecting remote LLM mode.
+- **Refactor**: split monolithic source modules into focused submodules. `src/llm.ts` → `src/llm/` (llama-cpp, session, singleton, formatting, model-cache, types). `src/store.ts` → `src/store/` (query-engine, retrieval, embedding-pipeline, chunking, chunking-async, cache, cleanup, document-ops, reindex, retrieval-paths, retrieval-snippets, config-sync, db-init, path-utils). `src/cli/qmd.ts` → `src/cli/` (parse, lifecycle, command-lifecycle, formatter, search-formatting, commands/).
+- **CLI**: `qmd status` now probes remote endpoint health (latency, state) for each configured role and reports the active provider. `qmd doctor` surfaces GPU/Metal mitigation state, embedding fingerprint diagnostics, and SQLite/sqlite-vec version info.
+- **CLI**: `qmd get` and `qmd multi-get` support `:from:count` suffix on paths/docids, are line-numbered by default, and show `#docid` + `qmd://` path in output headers.
+- **CLI**: `--full-path` flag on `get`, `multi-get`, `search`, and `query` replaces `qmd://` URIs with on-disk filesystem paths (`./`-prefixed when under `$PWD`).
+- **CLI**: `--explain` flag on `query` exposes per-result retrieval score traces (backend scores, RRF contributions, top-rank bonus, reranker score, final blend).
+- **CLI**: `--chunk-strategy auto` enables AST-aware chunking for code files (TS, JS, Python, Go, Rust) via tree-sitter. Code files chunk at function, class, and import boundaries.
+- **SDK**: `QMDStore` interface expanded with `search()`, `searchLex()`, `searchVector()`, `expandQuery()`, `getDocumentBody()`, `getDefaultCollectionNames()`, `setGlobalContext()`, `addCollection()`, `removeCollection()`, `renameCollection()`, `addContext()`, `listContexts()`, `removeContext()`, `update()`, `embed()`, `close()`. Inline config mode allows SDK usage without YAML files.
+- **Docs**: comprehensive architecture documentation in `docs/architecture.md` with Mermaid diagrams covering system overview, query pipeline, embedding pipeline, and module dependency map.
+- **CI**: GitHub Actions workflow updated for new module structure and remote adapter test suite.
+
+### Fixes
+
+- **Darwin Metal**: `finishSuccessfulCliCommand()` sets `process.exitCode = 0` and returns instead of calling `process.exit(0)`, so node-llama-cpp's `beforeExit` hook fires and disposes Metal contexts before libc's static destructor runs. Eliminates the multi-kB GGML/Metal backtrace at process exit on macOS.
+- **GPU**: `QMD_FORCE_CPU=1` / `--no-gpu` bypasses CUDA/Vulkan/Metal probing entirely. `QMD_EMBED_PARALLELISM` controls embedding/reranking context parallelism (defaults to 1 on Windows CUDA to avoid `ggml-cuda.cu:98` crashes).
+- **Embedding**: dimension mismatch detection prevents silent vector corruption when the remote embedding model changes. Error message guides users to `qmd embed -f`.
+- **Embedding**: partial chunk vectors are removed when chunk/session failures leave a document incomplete, keeping `qmd status` pending counts honest after interrupted embed runs.
+- **Embedding**: `qmd embed -c <collection>` scopes work to the requested collection; `--force` clears only collection-owned vectors and preserves shared hashes in sibling collections.
+- **Embedding**: embedding fingerprint tracks model identity + formatting + chunking parameters so stale vectors are treated as pending after configuration changes. Legacy `content_vectors` columns are migrated lazily on first access.
+- **Hybrid search**: RRF weights are assigned by query type (2.0× for original query, 1.0× for expansions) so the user's actual words get the intended boost.
+- **Hybrid search**: adaptive candidate limits based on score distribution (low/high ambiguity) optimize the reranker's input size.
+- **MCP**: seed llama.cpp/GGML quiet env vars before launching `qmd mcp` so native logs cannot pollute stdio JSON-RPC framing.
+- **MCP**: `qmd mcp --index <name>` uses the selected index for both foreground and daemon HTTP servers.
+- **CLI**: lazy-load `node-llama-cpp` so lightweight commands (`status`, `collection`, `context`) don't import native ML dependencies.
+- **CLI**: remove CommonJS `require()` calls from ESM index path normalization, fixing `ERR_AMBIGUOUS_MODULE_SYNTAX` on Node 22+.
+- **Launcher**: source-mode runner selection prefers Node + tsx over Bun when both lockfiles are present, fixing pnpm-global installs that previously routed through Bun and hit ABI mismatches with native modules.
+- **Store**: keep content rows referenced by inactive documents during orphan cleanup so `qmd update` preserves soft-deleted tombstones.
 
 ## [2.5.3] - 2026-05-28
 

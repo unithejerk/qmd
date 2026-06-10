@@ -1,9 +1,9 @@
 /**
  * Adapter registry and resolver.
  *
- * Phase 1 kept behavior stable by routing all formats to legacy adapters.
- * Phase 2 wired OpenAI-specific protocol adapters.
- * Phase 3 wires Anthropic Messages protocol adapters.
+ * Maps wire-protocol formats to their corresponding adapters for each
+ * endpoint role (embed, expand, rerank, generate). Unknown formats fall
+ * back to legacy adapters that handle protocol detection at request time.
  */
 
 import type { RemoteApiFormat } from '../../collections.js';

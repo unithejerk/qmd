@@ -193,13 +193,15 @@ let defaultLlamaCpp: LLM | null = null;
  * @returns The active LLM instance (never null — throws if uninitialized)
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
-  // When a remote LLM is configured, skip local model entirely
+  // If an explicit LLM was set (e.g. MockLLM for tests), return it.
+  if (defaultLlamaCpp) return defaultLlamaCpp as LlamaCpp;
+  // When a remote LLM is configured with no explicit LLM set, return a
+  // no-op stub that throws descriptive errors instead of building a local
+  // llama.cpp instance.
   if (isRemoteConfigured()) {
     return NoopLlamaCpp.instance as unknown as LlamaCpp;
   }
-  if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
-  }
+  defaultLlamaCpp = new LlamaCpp();
   return defaultLlamaCpp as LlamaCpp;
 }
 
