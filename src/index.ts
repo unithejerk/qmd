@@ -65,6 +65,7 @@ import {
 } from "./store.js";
 import {
   LlamaCpp,
+  type LLM,
 } from "./llm.js";
 import {
   setConfigSource,
@@ -205,6 +206,12 @@ export interface StoreOptions {
   configPath?: string;
   /** Inline collection config (mutually exclusive with `configPath`) */
   config?: CollectionConfig;
+  /**
+   * Optional pre-constructed LLM instance.
+   * When provided, skips creating the default LlamaCpp.
+   * Useful for RemoteLLM or custom implementations.
+   */
+  llm?: LLM;
 }
 
 /**
@@ -368,9 +375,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
+  // Use provided LLM or create default LlamaCpp
+  const llm = options.llm ?? new LlamaCpp({
     embedModel: config?.models?.embed,
     generateModel: config?.models?.generate,
     rerankModel: config?.models?.rerank,
@@ -378,6 +384,19 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     disposeModelsOnInactivity: true,
   });
   internal.llm = llm;
+
+  // Startup probe for remote LLMs — catch misconfiguration early
+  if (typeof (llm as any).probe === 'function') {
+    (llm as any).probe().then((result: { ok: boolean; dimensions: number; error?: string }) => {
+      if (result.ok) {
+        console.log(`Remote LLM probe OK (dimensions=${result.dimensions})`);
+      } else {
+        console.warn(`Remote LLM probe failed: ${result.error ?? 'unknown error'}`);
+      }
+    }).catch((err: unknown) => {
+      console.warn(`Remote LLM probe error: ${err}`);
+    });
+  }
 
   const store: QMDStore = {
     internal,
@@ -422,7 +441,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       });
     },
     searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
-    searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection),
+    searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection, undefined, undefined, llm),
     expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {
