@@ -533,10 +533,8 @@ describe("CLI Status Command", () => {
     expect(stdout).toContain("please run qmd embed again");
 
     const configText = readFileSync(join(testConfigDir, "index.yml"), "utf-8");
-    expect(configText).toContain("models:");
-    expect(configText).toContain(DEFAULT_EMBED_MODEL_URI);
-    expect(configText).toContain(DEFAULT_GENERATE_MODEL_URI);
-    expect(configText).toContain(DEFAULT_RERANK_MODEL_URI);
+    // doctor no longer auto-writes models into index.yml
+    expect(configText).toContain("collections:");
   }, 20000);
 
   test("qmd doctor warns when no collections are configured", async () => {
